@@ -17,6 +17,8 @@ flowchart LR
 
 - Deterministic directed simulated road graph with non-negative road distances and travel times.
 - Dijkstra paths, route expansion, capacity/distance/duration enforcement, and explicit unserved-bin reasons.
+- Per-vehicle starting graph location and current load; routing uses remaining payload capacity and current simulated congestion-adjusted travel times.
+- Per-bin assignment explanations with mock GPS coordinates, estimated arrival, post-pickup capacity, and alternative feasible insertion estimates.
 - OR-Tools CVRP with Guided Local Search for each rolling-horizon planning snapshot; the named nearest-feasible heuristic is only a dependency fallback.
 - An independent validator that reconstructs every route from graph edges; a route with missing required bins or a hard-constraint breach is `INFEASIBLE`.
 - Reproducible synthetic bin histories, a chronological Random Forest evaluation split, and latest-observation urgency predictions.
@@ -78,10 +80,15 @@ Example route request:
 {
   "depot": "n0_0",
   "stops": [{"bin_id": "BIN-001", "node": "n1_1", "demand_kg": 40, "urgency": "CRITICAL"}],
-  "vehicles": [{"vehicle_id": "truck-1", "capacity_kg": 600, "max_duration_minutes": 480}]
+  "vehicles": [{"vehicle_id": "truck-1", "capacity_kg": 600, "current_load_kg": 120, "current_node": "n2_2", "max_duration_minutes": 480}],
+  "traffic_multiplier": 1.4
 }
 ```
 
+`current_node` is a node in the simulated road graph (omit it to start at the depot). `current_load_kg` reduces the truck's remaining collection capacity. `traffic_multiplier` scales reproducible segment congestion estimates; it is a simulation control, not a live traffic feed. The solver minimizes estimated travel time and enforces capacity, distance, and duration limits.
+
+The optimize response includes `assignment_explanations`. Each explanation shows the selected truck and route-start ETA, plus estimated added time and remaining capacity if the bin were inserted into each truck's planned route. These are local insertion comparisons for transparency; the selected assignments come from the joint fleet optimization, so the lowest standalone insertion estimate is not guaranteed to be the final choice.
+
 ## Assumptions and limitations
 
-All coordinates, roads, observations, demand, fuel and emissions values are simulated estimates, not municipal measurements. Fuel assumes 32 L/100 km and 2.68 kg CO2/L. Demand may not be split between vehicles. Time-window architecture is represented in the domain model but is not yet scheduled by the heuristic; requests with windows should not be treated as supported routing behavior. The model uses synthetic data and therefore its reported metrics are diagnostic results for that simulation only, not field performance claims.
+All coordinates, roads, observations, demand, vehicle states, traffic, fuel and emissions values are simulated estimates, not municipal measurements. The optimizer accepts graph-node vehicle locations and a caller-supplied traffic multiplier, but has no GPS ingestion or live traffic provider integration yet. Fuel assumes 32 L/100 km and 2.68 kg CO2/L. Demand may not be split between vehicles. Time windows are not yet enforced. The model uses synthetic data and therefore its reported metrics are diagnostic results for that simulation only, not field performance claims.

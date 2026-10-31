@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from optimization.graph import build_grid_graph
 from optimization.problem import Stop, Vehicle
 from optimization.solver import solve
+from optimization.explanation import explain_assignments
 from optimization.route_validator import validate_routes
 from optimization.metrics import totals, compare
 from prediction.pipeline import generate_data, train, predict_latest
@@ -15,9 +16,9 @@ app = FastAPI(title="EcoRoute AI", version="0.1.0", description="Synthetic-data 
 ROOT=Path(__file__).resolve().parents[1]; RAW=ROOT/"data"/"raw"; MODELS=ROOT/"models"; EXP=ROOT/"experiments"
 
 class GenerateRequest(BaseModel): bins: int = Field(default=100, ge=2); days: int = Field(default=30, ge=2); seed: int = 42
-class VehicleIn(BaseModel): vehicle_id: str; capacity_kg: float = Field(ge=0); available: bool=True; max_distance_km: float|None=Field(default=None,ge=0); max_duration_minutes: float|None=Field(default=None,ge=0)
+class VehicleIn(BaseModel): vehicle_id: str; capacity_kg: float = Field(ge=0); available: bool=True; max_distance_km: float|None=Field(default=None,ge=0); max_duration_minutes: float|None=Field(default=None,ge=0); current_node: str|None=None; current_load_kg: float=Field(default=0,ge=0)
 class StopIn(BaseModel): bin_id: str; node: str; demand_kg: float=Field(ge=0); service_minutes: float=Field(default=4,ge=0); urgency: str="HIGH"
-class OptimizeRequest(BaseModel): depot: str="n0_0"; stops: list[StopIn]; vehicles: list[VehicleIn]; rows: int=8; cols: int=8; seed:int=42; solver_time_limit_seconds:int=Field(default=5,ge=1,le=60); reoptimization_interval_minutes:int=Field(default=15,ge=1,le=1440)
+class OptimizeRequest(BaseModel): depot: str="n0_0"; stops: list[StopIn]; vehicles: list[VehicleIn]; rows: int=8; cols: int=8; seed:int=42; traffic_multiplier: float=Field(default=1.0,ge=1.0,le=5.0); solver_time_limit_seconds:int=Field(default=5,ge=1,le=60); reoptimization_interval_minutes:int=Field(default=15,ge=1,le=1440)
 
 def read_data() -> tuple[pd.DataFrame,pd.DataFrame]:
     try: return pd.read_csv(RAW/"bins.csv"), pd.read_csv(RAW/"bin_history.csv",parse_dates=["timestamp"])
@@ -61,14 +62,28 @@ def predictions_get():
 
 def run_opt(request: OptimizeRequest):
     try:
-        graph=build_grid_graph(request.rows,request.cols,request.seed)
+        graph=build_grid_graph(request.rows,request.cols,request.seed,traffic_multiplier=request.traffic_multiplier)
         stops=[Stop(**x.model_dump()) for x in request.stops]; vehicles=[Vehicle(**x.model_dump()) for x in request.vehicles]
         return graph,stops,vehicles,solve(graph,request.depot,stops,vehicles,request.solver_time_limit_seconds)
     except ValueError as exc: raise HTTPException(422,str(exc))
 
 @app.post("/api/routes/optimize")
 def routes_optimize(request: OptimizeRequest):
-    _,_,_,result=run_opt(request); payload=result.to_dict(); payload["metrics"]=totals(result); payload["rolling_horizon"]={"reoptimization_interval_minutes":request.reoptimization_interval_minutes,"trigger":"scheduled interval or bin urgency event"}; return payload
+    graph,stops,vehicles,result=run_opt(request)
+    payload=result.to_dict()
+    payload["metrics"]=totals(result)
+    payload["fleet_snapshot"]=[
+        {"vehicle_id":vehicle.vehicle_id,"available":vehicle.available,
+         "mock_gps_node":vehicle.current_node or request.depot,
+         "latitude":graph.nodes[vehicle.current_node or request.depot]["latitude"],
+         "longitude":graph.nodes[vehicle.current_node or request.depot]["longitude"],
+         "capacity_kg":vehicle.capacity_kg,"current_load_kg":vehicle.current_load_kg,
+         "free_capacity_kg":vehicle.capacity_kg-vehicle.current_load_kg}
+        for vehicle in vehicles
+    ]
+    payload["assignment_explanations"]=explain_assignments(graph,request.depot,result.routes,vehicles,result.solver)
+    payload["rolling_horizon"]={"reoptimization_interval_minutes":request.reoptimization_interval_minutes,"trigger":"scheduled interval or bin urgency event"}
+    return payload
 
 @app.post("/api/routes/validate")
 def routes_validate(request: OptimizeRequest):

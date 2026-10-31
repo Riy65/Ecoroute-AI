@@ -33,10 +33,14 @@ class Vehicle:
     available: bool = True
     max_distance_km: float | None = None
     max_duration_minutes: float | None = None
+    current_node: str | None = None
+    current_load_kg: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.vehicle_id or self.capacity_kg < 0:
             raise ValueError("vehicle needs an ID and non-negative capacity")
+        if self.current_load_kg < 0 or self.current_load_kg > self.capacity_kg:
+            raise ValueError("current load must be between zero and vehicle capacity")
         if self.max_distance_km is not None and self.max_distance_km < 0:
             raise ValueError("max distance must be non-negative")
         if self.max_duration_minutes is not None and self.max_duration_minutes < 0:
@@ -52,6 +56,7 @@ class Route:
     travel_minutes: float = 0.0
     service_minutes: float = 0.0
     waiting_minutes: float = 0.0
+    starting_load_kg: float = 0.0
 
     @property
     def duration_minutes(self) -> float:
@@ -75,4 +80,5 @@ class RoutingResult:
         return {"status": self.status, "solver": self.solver,
                 "routes": [r.to_dict() for r in self.routes], "unserved": self.unserved,
                 "validation": self.validation, "runtime_seconds": self.runtime_seconds,
-                "objective_distance_km": self.objective_distance_km}
+                "objective_distance_km": self.objective_distance_km,
+                "objective": "minimize_estimated_travel_time"}

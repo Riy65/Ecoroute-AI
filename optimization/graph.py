@@ -4,10 +4,13 @@ import math
 import networkx as nx
 
 
-def build_grid_graph(rows: int = 8, cols: int = 8, seed: int = 42, directed: bool = True) -> nx.Graph:
+def build_grid_graph(rows: int = 8, cols: int = 8, seed: int = 42, directed: bool = True,
+                     traffic_multiplier: float = 1.0) -> nx.Graph:
     """Create a deterministic simulated road network; edge weights are road, not aerial, distances."""
     if rows < 2 or cols < 2:
         raise ValueError("grid needs at least two rows and columns")
+    if not math.isfinite(traffic_multiplier) or traffic_multiplier < 1.0:
+        raise ValueError("traffic multiplier must be finite and at least 1")
     graph = nx.DiGraph() if directed else nx.Graph()
     for r in range(rows):
         for c in range(cols):
@@ -21,9 +24,12 @@ def build_grid_graph(rows: int = 8, cols: int = 8, seed: int = 42, directed: boo
                 a, b = f"n{r}_{c}", f"n{rr}_{cc}"
                 # Road links deliberately vary by coordinates but are reproducible.
                 distance = round(0.34 + ((r * 17 + c * 7 + seed) % 8) * .015, 3)
-                minutes = round(distance / 24 * 60, 3)
-                graph.add_edge(a, b, distance_km=distance, travel_minutes=minutes)
-                graph.add_edge(b, a, distance_km=round(distance * 1.03, 3), travel_minutes=round(minutes * 1.03, 3))
+                # Reproducible segment-level congestion creates alternate fastest paths.
+                traffic = 1.0 + ((r * 13 + c * 5 + seed) % 5) * 0.12
+                minutes = round(distance / 24 * 60 * traffic * traffic_multiplier, 3)
+                graph.add_edge(a, b, distance_km=distance, travel_minutes=minutes, traffic_multiplier=traffic * traffic_multiplier)
+                reverse_distance = round(distance * 1.03, 3)
+                graph.add_edge(b, a, distance_km=reverse_distance, travel_minutes=round(minutes * 1.03, 3), traffic_multiplier=traffic * traffic_multiplier)
     validate_graph(graph)
     return graph
 
@@ -42,7 +48,7 @@ def shortest_leg(graph: nx.Graph, source: str, target: str) -> tuple[list[str], 
     if source not in graph or target not in graph:
         raise ValueError("unknown road node")
     try:
-        path = nx.shortest_path(graph, source, target, weight="distance_km", method="dijkstra")
+        path = nx.shortest_path(graph, source, target, weight="travel_minutes", method="dijkstra")
     except nx.NetworkXNoPath as exc:
         raise ValueError(f"unreachable: {source} -> {target}") from exc
     distance = sum(graph[u][v]["distance_km"] for u, v in zip(path, path[1:]))

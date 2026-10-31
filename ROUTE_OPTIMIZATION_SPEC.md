@@ -6,17 +6,17 @@ EcoRoute AI solves a capacitated vehicle-routing problem on a directed, weighted
 
 ## Inputs and outputs
 
-Each manifest item has a unique `bin_id`, graph `node`, non-negative demand in kilograms, service time in minutes, and urgency category. Vehicles have an identifier, non-negative capacity, availability, and optional per-route distance and duration limits. The graph edges carry non-negative distance (km) and travel time (minutes).
+Each manifest item has a unique `bin_id`, graph `node`, non-negative demand in kilograms, service time in minutes, and urgency category. Vehicles have an identifier, non-negative capacity, availability, current graph node, current load, and optional remaining distance and duration limits. The graph edges carry non-negative distance (km) and traffic-adjusted travel time (minutes).
 
 The solver returns per-vehicle ordered stops, expanded road-node paths, reconstructed distance, travel time, service time, total duration, metrics, solver identity/status, unserved bins and reasons, plus an independent validation report.
 
 ## Objective and constraints
 
-The primary objective is minimum total shortest-path road distance. Travel time, fuel, and emissions are reported metrics rather than silently mixed objective terms. Hard constraints are vehicle capacity, graph reachability, return to depot, vehicle availability, and configured distance, duration, and time-window limits. Critical bins are mandatory; a critical bin that cannot be served is reported as unserved and makes the result infeasible.
+The primary objective is minimum estimated drive and service time. Road distance remains a hard constraint and a reported metric. Hard constraints are remaining vehicle capacity (capacity minus current load), graph reachability from each vehicle's current node, return to depot, vehicle availability, and configured distance and duration limits. Critical bins are mandatory; a critical bin that cannot be served is reported as unserved and makes the result infeasible. Time windows remain unsupported.
 
 ## Algorithm
 
-The graph service uses Dijkstra shortest paths between locations. The routing service uses Google OR-Tools CVRP with a PATH_CHEAPEST_ARC initial solution and Guided Local Search improvement under a caller-configured time limit. Each request is one rolling-horizon planning snapshot; it is re-run on a scheduled interval or urgency event. If OR-Tools cannot be imported, it uses a deterministic nearest-feasible heuristic. Neither strategy reports global optimality. Both paths are passed to a separate validator that reconstructs costs from graph edges.
+The graph service uses Dijkstra shortest paths weighted by estimated travel time. The simulator creates reproducible segment congestion and accepts a traffic multiplier; this is not a live traffic integration. The routing service uses Google OR-Tools CVRP with a PATH_CHEAPEST_ARC initial solution and Guided Local Search improvement under a caller-configured time limit. Each request is one rolling-horizon planning snapshot; the caller must refresh vehicle state and re-run on a scheduled interval or when state changes. If OR-Tools cannot be imported, it uses a deterministic nearest-feasible heuristic. Neither strategy reports global optimality. Both paths are passed to a separate validator that reconstructs costs from graph edges.
 
 ## Urgency policy
 

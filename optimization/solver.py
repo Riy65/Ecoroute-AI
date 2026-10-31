@@ -20,9 +20,9 @@ def _append_leg(route: Route, graph: nx.Graph, source: str, target: str) -> None
 
 
 def _can_append(route: Route, stop: Stop, vehicle: Vehicle, graph: nx.Graph, depot: str) -> bool:
-    if sum(x.demand_kg for x in route.stops) + stop.demand_kg > vehicle.capacity_kg + 1e-9:
+    if vehicle.current_load_kg + sum(x.demand_kg for x in route.stops) + stop.demand_kg > vehicle.capacity_kg + 1e-9:
         return False
-    here = route.road_path[-1] if route.road_path else depot
+    here = route.road_path[-1] if route.road_path else (vehicle.current_node or depot)
     try:
         _, out_d, out_t = shortest_leg(graph, here, stop.node)
         _, back_d, back_t = shortest_leg(graph, stop.node, depot)
@@ -39,7 +39,7 @@ def _solve_heuristic(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: l
     started = time.perf_counter()
     if depot not in graph: raise ValueError("depot is not on graph")
     if len({s.bin_id for s in stops}) != len(stops): raise ValueError("duplicate bin IDs")
-    routes = [Route(vehicle_id=v.vehicle_id, road_path=[depot]) for v in vehicles if v.available]
+    routes = [Route(vehicle_id=v.vehicle_id, road_path=[v.current_node or depot], starting_load_kg=v.current_load_kg) for v in vehicles if v.available]
     active = [v for v in vehicles if v.available]
     remaining = sorted(stops, key=lambda s: ({"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}[s.urgency], s.bin_id))
     unserved: list[dict] = []
@@ -49,12 +49,12 @@ def _solve_heuristic(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: l
         for route, vehicle in zip(routes, active):
             if _can_append(route, stop, vehicle, graph, depot):
                 here = route.road_path[-1]
-                try: candidates.append((shortest_leg(graph, here, stop.node)[1], route, vehicle))
+                try: candidates.append((shortest_leg(graph, here, stop.node)[2], route, vehicle))
                 except ValueError: pass
         if not candidates:
             reason = "unreachable_or_constraint_infeasible"
             if not active: reason = "no_available_vehicle"
-            elif all(stop.demand_kg > v.capacity_kg for v in active): reason = "demand_exceeds_any_vehicle_capacity"
+            elif all(stop.demand_kg > v.capacity_kg - v.current_load_kg for v in active): reason = "demand_exceeds_any_vehicle_capacity"
             unserved.append({"bin_id": stop.bin_id, "urgency": stop.urgency, "reason": reason})
             continue
         _, route, vehicle = min(candidates, key=lambda item: (item[0], item[1].vehicle_id))
@@ -71,8 +71,8 @@ def _solve_heuristic(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: l
                          objective_distance_km=sum(r.distance_km for r in routes))
 
 
-def _expanded_route(graph: nx.Graph, depot: str, vehicle_id: str, stops: list[Stop]) -> Route:
-    route = Route(vehicle_id=vehicle_id, road_path=[depot])
+def _expanded_route(graph: nx.Graph, depot: str, vehicle_id: str, stops: list[Stop], start_node: str | None = None) -> Route:
+    route = Route(vehicle_id=vehicle_id, road_path=[start_node or depot])
     for stop in stops:
         _append_leg(route, graph, route.road_path[-1], stop.node)
         route.stops.append(stop)
@@ -86,19 +86,30 @@ def _expanded_route(graph: nx.Graph, depot: str, vehicle_id: str, stops: list[St
 
 def _precheck(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle]) -> tuple[list[Stop], list[dict]]:
     active = [vehicle for vehicle in vehicles if vehicle.available]
+    for vehicle in active:
+        if vehicle.current_node is not None and vehicle.current_node not in graph:
+            raise ValueError(f"unknown current node for vehicle {vehicle.vehicle_id}: {vehicle.current_node}")
     eligible: list[Stop] = []
     unserved: list[dict] = []
     for stop in stops:
         reason = None
         if not active:
             reason = "no_available_vehicle"
-        elif all(stop.demand_kg > vehicle.capacity_kg for vehicle in active):
+        elif all(stop.demand_kg > vehicle.capacity_kg - vehicle.current_load_kg for vehicle in active):
             reason = "demand_exceeds_any_vehicle_capacity"
         else:
-            try:
-                shortest_leg(graph, depot, stop.node)
-                shortest_leg(graph, stop.node, depot)
-            except ValueError:
+            reachable = False
+            for vehicle in active:
+                if stop.demand_kg > vehicle.capacity_kg - vehicle.current_load_kg:
+                    continue
+                try:
+                    shortest_leg(graph, vehicle.current_node or depot, stop.node)
+                    shortest_leg(graph, stop.node, depot)
+                    reachable = True
+                    break
+                except ValueError:
+                    continue
+            if not reachable:
                 reason = "unreachable_from_or_to_depot"
         if reason:
             unserved.append({"bin_id": stop.bin_id, "urgency": stop.urgency, "reason": reason})
@@ -118,13 +129,17 @@ def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: lis
         return RoutingResult("INFEASIBLE", "ortools_guided_local_search", routes, precheck_unserved, validation,
                              time.perf_counter() - started, 0.0)
     if not eligible:
-        routes = [Route(vehicle_id=vehicle.vehicle_id) for vehicle in active]
+        routes = [Route(vehicle_id=vehicle.vehicle_id, starting_load_kg=vehicle.current_load_kg) for vehicle in active]
         validation = validate_routes(graph, depot, routes, stops, vehicles)
         status = "FEASIBLE" if validation["valid"] else "INFEASIBLE"
         return RoutingResult(status, "ortools_guided_local_search", routes, precheck_unserved, validation,
                              time.perf_counter() - started, 0.0)
 
     locations = [depot] + [stop.node for stop in eligible]
+    start_indices = []
+    for vehicle in active:
+        start_indices.append(len(locations))
+        locations.append(vehicle.current_node or depot)
     count = len(locations)
     distance = [[0] * count for _ in range(count)]
     duration = [[0] * count for _ in range(count)]
@@ -136,21 +151,22 @@ def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: lis
             distance[i][j] = round(km * 1000)  # metres (integer constraint units)
             duration[i][j] = round(minutes * 1000)  # milliminutes preserve edge precision
 
-    manager = pywrapcp.RoutingIndexManager(count, len(active), 0)
+    manager = pywrapcp.RoutingIndexManager(count, len(active), start_indices, [0] * len(active))
     routing = pywrapcp.RoutingModel(manager)
     distance_callback = routing.RegisterTransitCallback(lambda a, b: distance[manager.IndexToNode(a)][manager.IndexToNode(b)])
-    routing.SetArcCostEvaluatorOfAllVehicles(distance_callback)
     routing.AddDimensionWithVehicleCapacity(distance_callback, 0,
                                             [round((v.max_distance_km if v.max_distance_km is not None else 1_000_000) * 1000) for v in active],
                                             True, "Distance")
 
-    demands = [0] + [round(stop.demand_kg * 1000) for stop in eligible]
+    demands = [0] + [round(stop.demand_kg * 1000) for stop in eligible] + [0] * len(active)
     demand_callback = routing.RegisterUnaryTransitCallback(lambda index: demands[manager.IndexToNode(index)])
-    routing.AddDimensionWithVehicleCapacity(demand_callback, 0, [round(v.capacity_kg * 1000) for v in active], True, "Capacity")
+    routing.AddDimensionWithVehicleCapacity(demand_callback, 0,
+                                            [round((v.capacity_kg - v.current_load_kg) * 1000) for v in active], True, "Capacity")
 
     # Each arc accrues driving time plus service time at the node being left.
-    service = [0] + [round(stop.service_minutes * 1000) for stop in eligible]
+    service = [0] + [round(stop.service_minutes * 1000) for stop in eligible] + [0] * len(active)
     time_callback = routing.RegisterTransitCallback(lambda a, b: duration[manager.IndexToNode(a)][manager.IndexToNode(b)] + service[manager.IndexToNode(a)])
+    routing.SetArcCostEvaluatorOfAllVehicles(time_callback)
     routing.AddDimensionWithVehicleCapacity(time_callback, 0,
                                             [round((v.max_duration_minutes if v.max_duration_minutes is not None else 1_000_000) * 1000) for v in active],
                                             True, "Time")
@@ -177,15 +193,17 @@ def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: lis
             index = routing.Start(vehicle_index)
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
-                if node:
+                if 1 <= node <= len(eligible):
                     ordered.append(eligible[node - 1]); served_indices.add(node)
                 index = assignment.Value(routing.NextVar(index))
-            routes.append(_expanded_route(graph, depot, vehicle.vehicle_id, ordered))
+            route = _expanded_route(graph, depot, vehicle.vehicle_id, ordered, vehicle.current_node)
+            route.starting_load_kg = vehicle.current_load_kg
+            routes.append(route)
         for index, stop in enumerate(eligible, start=1):
             if index not in served_indices:
                 unserved.append({"bin_id": stop.bin_id, "urgency": stop.urgency, "reason": "solver_dropped_or_constraint_infeasible"})
     else:
-        routes = [Route(vehicle_id=vehicle.vehicle_id) for vehicle in active]
+        routes = [Route(vehicle_id=vehicle.vehicle_id, starting_load_kg=vehicle.current_load_kg) for vehicle in active]
         unserved.extend({"bin_id": stop.bin_id, "urgency": stop.urgency, "reason": "no_feasible_solution"} for stop in eligible)
 
     validation = validate_routes(graph, depot, routes, stops, vehicles)
@@ -200,6 +218,9 @@ def solve(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle
         raise ValueError("depot is not on graph")
     if len({stop.bin_id for stop in stops}) != len(stops):
         raise ValueError("duplicate bin IDs")
+    for vehicle in vehicles:
+        if vehicle.current_node is not None and vehicle.current_node not in graph:
+            raise ValueError(f"unknown current node for vehicle {vehicle.vehicle_id}: {vehicle.current_node}")
     if ORTOOLS_AVAILABLE:
         return _solve_ortools(graph, depot, stops, vehicles, time_limit_seconds)
     return _solve_heuristic(graph, depot, stops, vehicles)
