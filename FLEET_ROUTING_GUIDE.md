@@ -27,6 +27,25 @@ Each pickup has a graph node, estimated waste demand, service time, and urgency.
 
 For each bin, the planner selects the truck with the shortest traffic-aware approach time from its mock GPS location among trucks with enough remaining payload and a feasible route insertion. It reserves capacity in urgency and demand order, then uses OR-Tools to order each truck's assigned pickups. Route distance, duration, and stop order are still based on the local simulated graph; Google traffic-aware ETAs guide the truck-to-bin assignment when available. The solver returns a feasible plan within its time limit; it does not claim a globally optimal plan. If OR-Tools is unavailable, a deterministic nearest-feasible heuristic is used instead.
 
+### Explain it simply
+
+EcoRoute plans pickups in two stages:
+
+1. **Assign bins to trucks.** It considers urgent and heavier pickups first. For each bin, it checks trucks that have enough remaining payload and can fit the pickup into a route that respects configured distance and time limits. It chooses the eligible truck with the shortest approach time from its mock GPS location, then reserves that truck's capacity before assigning the next bin. Google Routes traffic-aware ETAs are used for the comparison when available; otherwise the project uses its simulated road times.
+2. **Order each truck's pickups.** After bins have been assigned, OR-Tools arranges each truck's stops into a good route order while respecting its capacity and route limits. The route order and those limits use the project's simulated road network.
+
+A short description for a presentation is:
+
+> “We assign each bin to the closest truck that has enough capacity and can complete a valid route. Then an optimizer arranges that truck's pickups into an efficient order.”
+
+### What OR-Tools means here
+
+**OR-Tools** is Google's open-source toolkit for solving optimization problems. This project uses its vehicle-routing solver to order pickups for the truck assignments that were already selected. The routing problem is a **capacitated vehicle routing problem (CVRP)**: multiple vehicles must visit pickup locations while observing each vehicle's carrying capacity and route limits.
+
+The solver uses **Guided Local Search**. In practical terms, it tries different stop orders and steers away from route patterns that have been difficult to improve, aiming to find a better plan before its time limit. It is a search method, so the result is a good feasible plan when one is found; it is not a proof that the entire fleet has the globally best assignment and route.
+
+OR-Tools handles optimization in this project. It does not provide the map, GPS positions, or live traffic. Google Routes can provide traffic-aware travel times for comparing trucks and road geometry and leg metrics for the map. The project still calculates pickup order and route constraints with its simulated road network. If OR-Tools is unavailable, the project falls back to a deterministic nearest-feasible heuristic.
+
 ## What the dashboard shows
 
 Open **Route simulation**, set each truck's mock GPS node and current load in the sidebar, choose the urgency threshold, and select **Optimize current planning cycle**.
