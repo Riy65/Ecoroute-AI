@@ -20,11 +20,12 @@ Each pickup has a graph node, estimated waste demand, service time, and urgency.
 
 1. Builds a directed, simulated road graph. Its road links have distance and travel-time weights. Segment congestion is deterministic for a given seed; a traffic multiplier can increase the simulated travel times.
 2. Finds travel-time-weighted shortest paths between the depot, truck locations, and candidate pickups.
-3. Uses OR-Tools CVRP with Guided Local Search to choose a joint set of truck routes and pickup order, subject to availability, capacity, reachability, return-to-depot, and configured distance and duration limits.
-4. Treats critical pickups as mandatory. If a required pickup cannot be served, it is reported as unserved and the plan is marked infeasible. Other unserved pickups are also reported with a reason.
-5. Reconstructs route distance and time from graph edges and independently validates the result.
+3. Assigns pickups by urgency and demand order. For each pickup, it compares the traffic-aware truck-to-bin approach time for every available truck that has enough remaining payload and a feasible route insertion. It reserves that truck's capacity before assigning the next pickup. If a complete live route matrix is unavailable, it uses simulated road travel times for this comparison.
+4. Uses OR-Tools CVRP with Guided Local Search to optimize the pickup order within those truck assignments, subject to reachability, return-to-depot, and configured distance and duration limits.
+5. Treats critical pickups as mandatory. If a required pickup cannot be served, it is reported as unserved and the plan is marked infeasible. Other unserved pickups are also reported with a reason.
+6. Reconstructs route distance and time from graph edges and independently validates the result.
 
-For each bin, the planner selects the truck with the shortest traffic-weighted road time from its mock GPS location among trucks with enough remaining payload. It reserves capacity in urgency and demand order, then uses OR-Tools to order each truck's assigned pickups while respecting route limits. It returns a good feasible plan within its time limit; it does not claim a globally optimal plan. If OR-Tools is unavailable, a deterministic nearest-feasible heuristic is used instead.
+For each bin, the planner selects the truck with the shortest traffic-aware approach time from its mock GPS location among trucks with enough remaining payload and a feasible route insertion. It reserves capacity in urgency and demand order, then uses OR-Tools to order each truck's assigned pickups. Route distance, duration, and stop order are still based on the local simulated graph; Google traffic-aware ETAs guide the truck-to-bin assignment when available. The solver returns a feasible plan within its time limit; it does not claim a globally optimal plan. If OR-Tools is unavailable, a deterministic nearest-feasible heuristic is used instead.
 
 ## What the dashboard shows
 
@@ -37,11 +38,12 @@ The result includes:
 - An expandable truck detail with its ordered stop list, each stop's ETA from route start, pickup demand, and remaining capacity after each pickup.
 - A map with each bin as a **B** marker. Its color shows fill level: green (0–39%), yellow (40–69%), orange (70–89%), and red (90–100%). Clicking it shows fill, zone, urgency, collection prediction, and coordinates.
 - Each truck appears as a **T** marker at its mock GPS position. Gray means idle; blue means it has pickups assigned. Clicking a truck shows its status, current load, remaining capacity, next pickup, and planned pickup sequence.
-- Active truck popups include **Check optimized route**. It draws and zooms to that truck's road route, then shows the optimizer's simulated route estimate plus Google road distance and traffic-aware ETA by pickup leg when Routes API is available. Idle trucks stay as GPS markers without a route line. If Routes API fails, the popup falls back to simulated leg distance and ETA.
-- A **Show truck route on map** action in each truck card focuses the map on that truck. The map keeps route lines hidden until an operator asks to check the active truck's route.
-- Per-bin assignment explanations. These show traffic-weighted approach time and remaining capacity for each truck, so the nearest capable assignment is visible.
+- Active truck popups compare the next pickup's approach ETA from every available truck's mock GPS location. The comparison labels the assigned truck, identifies other feasible trucks, and gives the capacity or route-limit reason when a truck is ineligible. Times use Google Routes traffic-aware ETAs when the full live matrix is available, otherwise simulated road-time estimates.
+- Active truck popups include **Check optimized route**. It draws and zooms to that truck's road route, then shows the optimizer's simulated route estimate plus Google road distance and traffic-aware ETA by pickup leg when Routes API is available. Only the currently selected truck's route is visible; selecting another truck hides the previous route. Idle trucks stay as GPS markers without a route line. If Routes API fails, the popup falls back to simulated leg distance and ETA.
+- A **Show truck route on map** action in each truck card focuses the map on that truck. Route lines stay hidden until an operator checks an active truck's route.
+- Per-bin assignment explanations show approach time and remaining capacity for each truck, making the nearest capable assignment visible in the dashboard table as well as the truck popup.
 
-The optimizer's route order and ETA remain simulated graph estimates. Google route distance and traffic-aware time are provided for explanation in the route popup; arrival estimates add the prototype's service time at prior pickups. Re-run the optimizer after changing truck locations, loads, traffic settings, or the pickup manifest to create an updated plan.
+Truck assignment uses the Google Routes traffic-aware matrix when available, and the popup's comparison lists each truck's approach ETA for the next pickup. The optimizer's route order, route limits, distance, duration, and simulated ETA remain based on the local graph. Google route distance and traffic-aware time are also provided for explanation in the route popup; arrival estimates add the prototype's service time at prior pickups. Re-run the optimizer after changing truck locations, loads, traffic settings, or the pickup manifest to create an updated plan.
 
 ## API endpoint
 
@@ -87,10 +89,10 @@ Google Routes supplies road geometry and traffic-aware distance/time for the rou
 
 ## Prototype boundaries
 
-- GPS positions, coordinates, road links, and bin demand are simulated. Assignment uses Google traffic-aware ETA when the separate server key is available; local graph ETAs are the fallback. Route constraints and route-start ETAs remain simulated graph estimates.
+- GPS positions, coordinates, road links, and bin demand are simulated. Assignment uses Google traffic-aware approach ETAs when the server Routes key is available and the matrix request succeeds; local graph ETAs are the fallback. Route constraints and route-start ETAs remain simulated graph estimates.
 - There is no live GPS ingestion, live traffic feed, automatic background re-optimization scheduler, or real driver push notification. The dashboard's “Dispatch notice” is an on-screen explanation of the first planned pickup.
 - The rolling-horizon interval is a planning setting/response description; the operator must trigger a new optimization cycle in this prototype.
-- Google supplies road geometry and the selected popup's traffic-aware leg metrics when Routes API is available, but Google does not choose which truck gets each bin. Assignment and route order still come from the simulated graph optimizer.
+- Google supplies traffic-aware truck-to-bin comparison ETAs for assignment and road geometry plus traffic-aware leg metrics for the selected popup when Routes API is available. The application uses those ETAs to select a feasible truck; Google does not make the assignment decision. Pickup order and route constraints still use the simulated graph optimizer.
 - The optimizer does not split a bin's demand across trucks. Time windows are not enforced.
 
 These boundaries make the demo explainable while keeping the fleet assignment and capacity decisions visible in the code and dashboard.
