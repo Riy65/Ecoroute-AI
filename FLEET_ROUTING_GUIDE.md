@@ -34,6 +34,8 @@ EcoRoute plans pickups in two stages:
 1. **Assign bins to trucks.** It considers urgent and heavier pickups first. For each bin, it checks trucks that have enough remaining payload and can fit the pickup into a route that respects configured distance and time limits. It chooses the eligible truck with the shortest approach time from its mock GPS location, then reserves that truck's capacity before assigning the next bin. Google Routes traffic-aware ETAs are used for the comparison when available; otherwise the project uses its simulated road times.
 2. **Order each truck's pickups.** After bins have been assigned, OR-Tools arranges each truck's stops into a good route order while respecting its capacity and route limits. The route order and those limits use the project's simulated road network.
 
+Here, **closest** means the lowest estimated road travel time from a truck's mock GPS position to the bin, not the shortest straight-line distance. Urgency is considered first so critical and high-urgency bins are planned before lower-urgency bins; demand size is used as a tie-breaker within an urgency level. This helps prioritize important pickups while reserving each truck's payload as bins are assigned.
+
 A short description for a presentation is:
 
 > “We assign each bin to the closest truck that has enough capacity and can complete a valid route. Then an optimizer arranges that truck's pickups into an efficient order.”
@@ -42,7 +44,7 @@ A short description for a presentation is:
 
 **OR-Tools** is Google's open-source toolkit for solving optimization problems. This project uses its vehicle-routing solver to order pickups for the truck assignments that were already selected. The routing problem is a **capacitated vehicle routing problem (CVRP)**: multiple vehicles must visit pickup locations while observing each vehicle's carrying capacity and route limits.
 
-The solver uses **Guided Local Search**. In practical terms, it tries different stop orders and steers away from route patterns that have been difficult to improve, aiming to find a better plan before its time limit. It is a search method, so the result is a good feasible plan when one is found; it is not a proof that the entire fleet has the globally best assignment and route.
+The solver uses **Guided Local Search**. In practical terms, it tries different stop orders and steers away from route patterns that have been difficult to improve, aiming to find a better plan before its time limit. The application independently validates the returned plan against its modeled constraints. A valid plan satisfies those constraints, but the search does not prove that the entire fleet has the globally best assignment and route.
 
 OR-Tools handles optimization in this project. It does not provide the map, GPS positions, or live traffic. Google Routes can provide traffic-aware travel times for comparing trucks and road geometry and leg metrics for the map. The project still calculates pickup order and route constraints with its simulated road network. If OR-Tools is unavailable, the project falls back to a deterministic nearest-feasible heuristic.
 
@@ -109,6 +111,7 @@ Google Routes supplies road geometry and traffic-aware distance/time for the rou
 ## Prototype boundaries
 
 - GPS positions, coordinates, road links, and bin demand are simulated. Assignment uses Google traffic-aware approach ETAs when the server Routes key is available and the matrix request succeeds; local graph ETAs are the fallback. Route constraints and route-start ETAs remain simulated graph estimates.
+- A truck marker shows its configured mock GPS position. The planned route line shows its route through assigned pickups; the prototype does not ingest live truck GPS or animate real vehicle movement.
 - There is no live GPS ingestion, live traffic feed, automatic background re-optimization scheduler, or real driver push notification. The dashboard's “Dispatch notice” is an on-screen explanation of the first planned pickup.
 - The rolling-horizon interval is a planning setting/response description; the operator must trigger a new optimization cycle in this prototype.
 - Google supplies traffic-aware truck-to-bin comparison ETAs for assignment and road geometry plus traffic-aware leg metrics for the selected popup when Routes API is available. The application uses those ETAs to select a feasible truck; Google does not make the assignment decision. Pickup order and route constraints still use the simulated graph optimizer.
