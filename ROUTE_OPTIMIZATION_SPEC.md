@@ -12,7 +12,7 @@ The solver returns per-vehicle ordered stops, expanded road-node paths, reconstr
 
 ## Objective and constraints
 
-The primary objective is minimum estimated drive and service time. Road distance remains a hard constraint and a reported metric. Hard constraints are remaining vehicle capacity (capacity minus current load), graph reachability from each vehicle's current node, return to depot, vehicle availability, and configured distance and duration limits. Critical bins are mandatory; a critical bin that cannot be served is reported as unserved and makes the result infeasible. Time windows remain unsupported.
+Each bin is first assigned to the truck with the shortest traffic-weighted road travel time from its current node among trucks with enough remaining payload. Capacity is reserved in urgency and demand order. OR-Tools then orders the assigned stops on each truck while enforcing remaining capacity, graph reachability, return to depot, availability, and configured distance and duration limits. Road distance remains a hard constraint and a reported metric. Critical bins are mandatory; a critical bin that cannot be served is reported as unserved and makes the result infeasible. Time windows remain unsupported.
 
 ## Algorithm
 

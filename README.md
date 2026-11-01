@@ -17,9 +17,11 @@ flowchart LR
 
 - Deterministic directed simulated road graph with non-negative road distances and travel times.
 - Dijkstra paths, route expansion, capacity/distance/duration enforcement, and explicit unserved-bin reasons.
-- Per-vehicle starting graph location and current load; routing uses remaining payload capacity and current simulated congestion-adjusted travel times.
-- Per-bin assignment explanations with mock GPS coordinates, estimated arrival, post-pickup capacity, and alternative feasible insertion estimates.
-- OR-Tools CVRP with Guided Local Search for each rolling-horizon planning snapshot; the named nearest-feasible heuristic is only a dependency fallback.
+- Per-vehicle starting graph location and current load; routing uses remaining payload capacity, and the local graph provides route constraints and fallback travel times.
+- Google Routes Compute Route Matrix traffic-aware ETA and distance comparisons for every truck/bin pair when a server key is configured; assignment falls back visibly to simulated travel time otherwise.
+- Nearest-capable truck assignment for each bin, using traffic-weighted travel time from mock GPS and reserving current payload capacity before route planning.
+- Per-bin assignment explanations with approach time from each truck's GPS location, estimated arrival, and post-pickup capacity.
+- OR-Tools CVRP with Guided Local Search to order each truck's assigned pickups; the named nearest-feasible heuristic is only a dependency fallback.
 - An independent validator that reconstructs every route from graph edges; a route with missing required bins or a hard-constraint breach is `INFEASIBLE`.
 - Reproducible synthetic bin histories, a chronological Random Forest evaluation split, and latest-observation urgency predictions.
 - Estimated fuel and CO2 metrics, fixed-order same-stop comparison, and FastAPI endpoints.
@@ -60,7 +62,7 @@ python -m streamlit run dashboard.py
 
 It opens a browser page where you can generate the synthetic data, train the model, view urgency predictions, choose the collection policy, optimize routes, and inspect independent validation results. It uses the same local project code and data files as the API.
 
-To use Google Maps for the dashboard map, create `.env` by copying `.env.example`, then set `GOOGLE_MAPS_API_KEY` to a browser-restricted key with **Maps JavaScript API** and **Routes API** enabled. Keep the key out of version control. Google road geometry is requested only after you optimize a route; without a key, the dashboard shows its local fallback map.
+For browser maps, configure `GOOGLE_MAPS_API_KEY` with **Maps JavaScript API** and **Routes API** enabled and an HTTP-referrer restriction for the dashboard. To use traffic-aware truck assignment, also configure a separate `GOOGLE_ROUTES_API_KEY` with **Routes API** enabled and a server IP restriction. The backend key is kept out of the browser; a browser-referrer key cannot authenticate a server-side Routes API request. Both keys must belong to a billing-enabled Google Cloud project. Without the server key, map display still works but assignment falls back visibly to simulated traffic. Keep both keys out of version control.
 
 After optimization, the map displays every active truck. Trucks with a route animate over Google road geometry; unused trucks remain visible beside the depot and are labelled with their full remaining capacity.
 
@@ -87,7 +89,7 @@ Example route request:
 
 `current_node` is a node in the simulated road graph (omit it to start at the depot). `current_load_kg` reduces the truck's remaining collection capacity. `traffic_multiplier` scales reproducible segment congestion estimates; it is a simulation control, not a live traffic feed. The solver minimizes estimated travel time and enforces capacity, distance, and duration limits.
 
-The optimize response includes `assignment_explanations`. Each explanation shows the selected truck and route-start ETA, plus estimated added time and remaining capacity if the bin were inserted into each truck's planned route. These are local insertion comparisons for transparency; the selected assignments come from the joint fleet optimization, so the lowest standalone insertion estimate is not guaranteed to be the final choice.
+The optimize response includes `assignment_explanations`. Each explanation shows the selected truck, its approach time from mock GPS, other trucks' approach times, and remaining capacity. When configured, approach times come from Google's traffic-aware route matrix; otherwise they use simulated road times. The nearest capable truck gets the bin, then OR-Tools orders that truck's assigned pickups subject to route limits.
 
 ## Assumptions and limitations
 

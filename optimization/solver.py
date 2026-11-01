@@ -34,7 +34,7 @@ def _can_append(route: Route, stop: Stop, vehicle: Vehicle, graph: nx.Graph, dep
             (vehicle.max_duration_minutes is None or projected_duration <= vehicle.max_duration_minutes + 1e-9))
 
 
-def _solve_heuristic(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle]) -> RoutingResult:
+def _solve_heuristic(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle], live_travel_matrix=None) -> RoutingResult:
     """Fallback used only when OR-Tools cannot be imported."""
     started = time.perf_counter()
     if depot not in graph: raise ValueError("depot is not on graph")
@@ -49,7 +49,11 @@ def _solve_heuristic(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: l
         for route, vehicle in zip(routes, active):
             if _can_append(route, stop, vehicle, graph, depot):
                 here = route.road_path[-1]
-                try: candidates.append((shortest_leg(graph, here, stop.node)[2], route, vehicle))
+                try:
+                    simulated_minutes = shortest_leg(graph, here, stop.node)[2]
+                    live_leg = (live_travel_matrix or {}).get((vehicle.vehicle_id, stop.bin_id))
+                    approach_minutes = live_leg["duration_minutes"] if live_leg else simulated_minutes
+                    candidates.append((approach_minutes, route, vehicle))
                 except ValueError: pass
         if not candidates:
             reason = "unreachable_or_constraint_infeasible"
@@ -118,7 +122,69 @@ def _precheck(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Veh
     return eligible, unserved
 
 
-def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle], time_limit_seconds: int) -> RoutingResult:
+def _nearest_capable_vehicle_by_stop(
+    graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle],
+    live_travel_matrix: dict[tuple[str, str], dict[str, float]] | None = None,
+) -> dict[int, int]:
+    """Match stops to the nearest truck with payload left, using live ETAs when supplied."""
+    remaining_capacity = [vehicle.capacity_kg - vehicle.current_load_kg for vehicle in vehicles]
+    planned_stops: list[list[Stop]] = [[] for _ in vehicles]
+    assignments: dict[int, int] = {}
+    urgency_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    ordered_stops = sorted(
+        enumerate(stops),
+        key=lambda item: (urgency_rank[item[1].urgency], -item[1].demand_kg, item[1].bin_id),
+    )
+    for stop_index, stop in ordered_stops:
+        candidates = []
+        for vehicle_index, vehicle in enumerate(vehicles):
+            if remaining_capacity[vehicle_index] + 1e-9 < stop.demand_kg:
+                continue
+            try:
+                _, simulated_approach_km, simulated_approach_minutes = shortest_leg(
+                    graph, vehicle.current_node or depot, stop.node
+                )
+            except ValueError:
+                continue
+            live_leg = (live_travel_matrix or {}).get((vehicle.vehicle_id, stop.bin_id))
+            approach_minutes = live_leg["duration_minutes"] if live_leg else simulated_approach_minutes
+            approach_km = live_leg["distance_km"] if live_leg else simulated_approach_km
+            existing = planned_stops[vehicle_index]
+            best_insertion = None
+            for position in range(len(existing) + 1):
+                proposed = existing[:position] + [stop] + existing[position:]
+                distance = travel = service = 0.0
+                current = vehicle.current_node or depot
+                try:
+                    for item in proposed:
+                        _, leg_distance, leg_time = shortest_leg(graph, current, item.node)
+                        distance += leg_distance
+                        travel += leg_time
+                        service += item.service_minutes
+                        current = item.node
+                    _, leg_distance, leg_time = shortest_leg(graph, current, depot)
+                    distance += leg_distance
+                    travel += leg_time
+                except ValueError:
+                    continue
+                duration = travel + service
+                if vehicle.max_distance_km is not None and distance > vehicle.max_distance_km + 1e-9:
+                    continue
+                if vehicle.max_duration_minutes is not None and duration > vehicle.max_duration_minutes + 1e-9:
+                    continue
+                if best_insertion is None or duration < best_insertion[0]:
+                    best_insertion = (duration, proposed)
+            if best_insertion is not None:
+                candidates.append((approach_minutes, approach_km, vehicle.vehicle_id, vehicle_index, best_insertion[1]))
+        if candidates:
+            _, _, _, chosen_index, ordered_stops = min(candidates)
+            assignments[stop_index] = chosen_index
+            remaining_capacity[chosen_index] -= stop.demand_kg
+            planned_stops[chosen_index] = ordered_stops
+    return assignments
+
+
+def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle], time_limit_seconds: int, live_travel_matrix=None) -> RoutingResult:
     """Solve a CVRP with OR-Tools Guided Local Search and independently reconstruct every route."""
     started = time.perf_counter()
     active = [vehicle for vehicle in vehicles if vehicle.available]
@@ -134,6 +200,8 @@ def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: lis
         status = "FEASIBLE" if validation["valid"] else "INFEASIBLE"
         return RoutingResult(status, "ortools_guided_local_search", routes, precheck_unserved, validation,
                              time.perf_counter() - started, 0.0)
+
+    nearest_assignments = _nearest_capable_vehicle_by_stop(graph, depot, eligible, active, live_travel_matrix)
 
     locations = [depot] + [stop.node for stop in eligible]
     start_indices = []
@@ -170,10 +238,17 @@ def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: lis
     routing.AddDimensionWithVehicleCapacity(time_callback, 0,
                                             [round((v.max_duration_minutes if v.max_duration_minutes is not None else 1_000_000) * 1000) for v in active],
                                             True, "Time")
+    # For each fixed truck assignment, reduce total travel/service time while
+    # also favoring a shorter longest route when choosing stop order.
+    routing.GetDimensionOrDie("Time").SetGlobalSpanCostCoefficient(1)
 
     # Critical stops are hard mandatory. Others carry a prohibitive penalty, so any dropped stop is explicit.
     for index, stop in enumerate(eligible, start=1):
         routing_index = manager.NodeToIndex(index)
+        assigned_vehicle = nearest_assignments.get(index - 1)
+        if assigned_vehicle is not None:
+            # Keep optional stops droppable when the route model proves them infeasible.
+            routing.VehicleVar(routing_index).SetValues([assigned_vehicle, -1])
         if stop.urgency != "CRITICAL":
             routing.AddDisjunction([routing_index], 10**12)
 
@@ -208,11 +283,12 @@ def _solve_ortools(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: lis
 
     validation = validate_routes(graph, depot, routes, stops, vehicles)
     status = "FEASIBLE" if validation["valid"] else "INFEASIBLE"
-    return RoutingResult(status, "ortools_cvrp_guided_local_search", routes, unserved, validation,
+    return RoutingResult(status, "ortools_nearest_capable_cvrp_guided_local_search", routes, unserved, validation,
                          time.perf_counter() - started, sum(route.distance_km for route in routes))
 
 
-def solve(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle], time_limit_seconds: int = 5) -> RoutingResult:
+def solve(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle], time_limit_seconds: int = 5,
+          live_travel_matrix: dict[tuple[str, str], dict[str, float]] | None = None) -> RoutingResult:
     """Solve the active rolling-horizon planning snapshot with OR-Tools, or a named fallback."""
     if depot not in graph:
         raise ValueError("depot is not on graph")
@@ -222,5 +298,5 @@ def solve(graph: nx.Graph, depot: str, stops: list[Stop], vehicles: list[Vehicle
         if vehicle.current_node is not None and vehicle.current_node not in graph:
             raise ValueError(f"unknown current node for vehicle {vehicle.vehicle_id}: {vehicle.current_node}")
     if ORTOOLS_AVAILABLE:
-        return _solve_ortools(graph, depot, stops, vehicles, time_limit_seconds)
-    return _solve_heuristic(graph, depot, stops, vehicles)
+        return _solve_ortools(graph, depot, stops, vehicles, time_limit_seconds, live_travel_matrix)
+    return _solve_heuristic(graph, depot, stops, vehicles, live_travel_matrix)

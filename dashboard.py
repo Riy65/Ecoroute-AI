@@ -13,6 +13,7 @@ from optimization.graph import build_grid_graph
 from optimization.explanation import explain_assignments
 from optimization.metrics import totals
 from optimization.problem import Stop, Vehicle
+from optimization.google_routes import fetch_live_travel_matrix
 from optimization.solver import solve
 from prediction.pipeline import generate_data, predict_latest, train
 
@@ -34,17 +35,25 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return pd.read_csv(RAW / "bins.csv"), pd.read_csv(RAW / "bin_history.csv", parse_dates=["timestamp"])
 
 
-def route_map(points: pd.DataFrame, route_result: dict | None, capacity: float) -> pdk.Deck:
+def route_map(points: pd.DataFrame, route_result: dict | None, capacity: float, selected_vehicle_id: str | None = None) -> pdk.Deck:
     """Map simulated bin state and planned truck paths; all paths use the visible bin positions."""
-    urgency_color = {"LOW": [76, 175, 80], "MEDIUM": [255, 193, 7], "HIGH": [255, 112, 67], "CRITICAL": [220, 53, 69]}
+    def fill_color(fill: float) -> list[int]:
+        if fill >= 90:
+            return [211, 47, 47]
+        if fill >= 70:
+            return [239, 108, 0]
+        if fill >= 40:
+            return [251, 192, 45]
+        return [46, 125, 50]
+
     bins_layer = points.assign(
-        color=points["urgency_category"].map(urgency_color),
-        label=points.apply(lambda row: f"{row.bin_id}  {row.urgency_category}", axis=1),
+        color=points["current_fill_level_pct"].map(fill_color),
+        label="B",
     )
     center = {"lat": float(points.latitude.mean()), "lon": float(points.longitude.mean())}
     layers: list = [
-        pdk.Layer("ScatterplotLayer", bins_layer, get_position="[longitude, latitude]", get_fill_color="color", get_radius=105, pickable=True),
-        pdk.Layer("TextLayer", bins_layer, get_position="[longitude, latitude]", get_text="label", get_color=[20, 20, 20], get_size=11, get_alignment_baseline="bottom", get_pixel_offset=[0, -8]),
+        pdk.Layer("ScatterplotLayer", bins_layer, get_position="[longitude, latitude]", get_fill_color="color", get_radius=105, get_line_color=[255, 255, 255], line_width_min_pixels=2, stroked=True, pickable=True),
+        pdk.Layer("TextLayer", bins_layer, get_position="[longitude, latitude]", get_text="label", get_color=[255, 255, 255], get_size=12, get_alignment_baseline="center"),
     ]
     depot = [center["lon"], center["lat"]]
     if route_result:
@@ -62,22 +71,20 @@ def route_map(points: pd.DataFrame, route_result: dict | None, capacity: float) 
             positions = [start_position] + [[float(by_id.loc[s].longitude), float(by_id.loc[s].latitude)] for s in stop_ids] + [depot]
             remaining = max(0.0, capacity - route.get("starting_load_kg", 0.0) - sum(stop["demand_kg"] for stop in route["stops"]))
             color = colors[index % len(colors)]
-            if stop_ids:
-                paths.append({"path": positions, "color": color, "vehicle": route["vehicle_id"]})
             next_stop = route["stops"][0] if stop_ids else None
             next_explanation = explanation_by_bin.get(next_stop["bin_id"], {}) if next_stop else {}
             next_eta = next_explanation.get("estimated_arrival_minutes_from_route_start")
             next_label = f"Next {next_stop['bin_id']} · +{next_eta:.1f} min" if next_stop and next_eta is not None else "No assigned pickup"
-            trucks.append({"longitude": start_position[0], "latitude": start_position[1], "label": f"🚚 {route['vehicle_id']}\n{next_label}\n{remaining:.0f} kg free", "color": color})
+            trucks.append({"longitude": start_position[0], "latitude": start_position[1], "label": "T", "status": "Active on pickup route" if stop_ids else "Idle", "color": [21, 101, 192] if stop_ids else [117, 117, 117], "vehicle": route["vehicle_id"], "next_label": next_label, "remaining": remaining})
         if paths:
             layers.append(pdk.Layer("PathLayer", paths, get_path="path", get_color="color", get_width=5, width_min_pixels=3, pickable=True))
         if trucks:
-            layers.append(pdk.Layer("ScatterplotLayer", trucks, get_position="[longitude, latitude]", get_fill_color="color", get_radius=180, pickable=True))
-            layers.append(pdk.Layer("TextLayer", trucks, get_position="[longitude, latitude]", get_text="label", get_color=[0, 0, 0], get_size=14, get_alignment_baseline="top", get_pixel_offset=[0, 12]))
+            layers.append(pdk.Layer("ScatterplotLayer", trucks, get_position="[longitude, latitude]", get_fill_color="color", get_radius=180, get_line_color=[255, 255, 255], line_width_min_pixels=2, stroked=True, pickable=True))
+            layers.append(pdk.Layer("TextLayer", trucks, get_position="[longitude, latitude]", get_text="label", get_color=[255, 255, 255], get_size=14, get_alignment_baseline="center", pickable=True))
     depot_layer = pd.DataFrame([{"longitude": depot[0], "latitude": depot[1], "label": "DEPOT"}])
     layers.append(pdk.Layer("ScatterplotLayer", depot_layer, get_position="[longitude, latitude]", get_fill_color=[33, 33, 33], get_radius=190))
     layers.append(pdk.Layer("TextLayer", depot_layer, get_position="[longitude, latitude]", get_text="label", get_color=[0, 0, 0], get_size=14, get_alignment_baseline="top"))
-    return pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=center["lat"], longitude=center["lon"], zoom=13, pitch=0), tooltip={"text": "{bin_id}\nUrgency: {urgency_category}\nFill: {current_fill_level_pct}%"}, map_style="light")
+    return pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=center["lat"], longitude=center["lon"], zoom=13, pitch=0), tooltip={"html": "<b>{bin_id}</b><br/>Fill: {current_fill_level_pct}%<br/>{urgency_category}<b>{vehicle}</b><br/>{status}<br/>{next_label}<br/>Free capacity: {remaining} kg", "style": {"backgroundColor": "#fff", "color": "#222"}}, map_style="light")
 
 
 def google_maps_key() -> str | None:
@@ -99,14 +106,39 @@ def google_maps_key() -> str | None:
     return None
 
 
-def render_google_map(points: pd.DataFrame, route_result: dict | None, capacity: float) -> None:
+def google_routes_server_key() -> str | None:
+    """Read a server-side Routes key; browser-referrer keys cannot authenticate backend calls."""
+    try:
+        key = st.secrets.get("GOOGLE_ROUTES_API_KEY")
+        if key:
+            return str(key)
+    except FileNotFoundError:
+        pass
+    key = os.getenv("GOOGLE_ROUTES_API_KEY")
+    if key:
+        return key
+    env_file = ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("GOOGLE_ROUTES_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"') or None
+    return None
+
+
+def render_google_map(points: pd.DataFrame, route_result: dict | None, capacity: float, selected_vehicle_id: str | None = None) -> None:
     key = google_maps_key()
     if not key:
         st.warning("Add `GOOGLE_MAPS_API_KEY` to `.env` to use Google Maps. Showing the local fallback map until a key is configured.")
-        st.pydeck_chart(route_map(points, route_result, capacity), use_container_width=True)
+        st.pydeck_chart(route_map(points, route_result, capacity, selected_vehicle_id), use_container_width=True)
         return
-    urgency_color = {"LOW": "#4caf50", "MEDIUM": "#ffc107", "HIGH": "#ff7043", "CRITICAL": "#dc3545"}
-    bins = [{"id": row.bin_id, "lat": float(row.latitude), "lng": float(row.longitude), "urgency": row.urgency_category, "fill": round(float(row.current_fill_level_pct), 1), "color": urgency_color[row.urgency_category]} for _, row in points.iterrows()]
+    bins = [{
+        "id": row.bin_id, "lat": float(row.latitude), "lng": float(row.longitude),
+        "zone": str(getattr(row, "zone_id", "Unknown zone")),
+        "urgency": str(row.urgency_category), "fill": round(float(row.current_fill_level_pct), 1),
+        "urgency_probability": round(float(getattr(row, "urgency_probability", 0.0)) * 100, 1),
+        "needs_collection": bool(getattr(row, "predicted_collection_required", False)),
+        "color": "#d32f2f" if float(row.current_fill_level_pct) >= 90 else "#ef6c00" if float(row.current_fill_level_pct) >= 70 else "#fbc02d" if float(row.current_fill_level_pct) >= 40 else "#2e7d32",
+    } for _, row in points.iterrows()]
     center = {"lat": float(points.latitude.mean()), "lng": float(points.longitude.mean())}
     depot = center.copy()
     routes, trucks = [], []
@@ -126,6 +158,23 @@ def render_google_map(points: pd.DataFrame, route_result: dict | None, capacity:
                 routes.append({"path": path, "color": color, "vehicle": route["vehicle_id"]})
             first_stop = stops[0] if stops else None
             first_details = explanation_by_bin.get(first_stop["bin_id"], {}) if first_stop else {}
+            assignment_comparison = sorted(
+                [
+                    {
+                        "vehicle": candidate.get("vehicle_id"),
+                        "eta_minutes": candidate.get("approach_minutes"),
+                        "feasible": bool(candidate.get("feasible", False)),
+                        "reason": candidate.get("infeasible_reason"),
+                        "selected": candidate.get("vehicle_id") == route["vehicle_id"],
+                    }
+                    for candidate in first_details.get("vehicle_insertion_estimates", [])
+                ],
+                key=lambda item: item["eta_minutes"] if item["eta_minutes"] is not None else float("inf"),
+            )
+            comparison_uses_live_traffic = bool(
+                route_result.get("assignment_live_pairs")
+                and route_result.get("assignment_live_pairs") == route_result.get("assignment_expected_pairs")
+            )
             # Every active truck remains visible at its mock GPS location, even if it has no stops.
             trucks.append({
                 "lat": start["lat"], "lng": start["lng"], "vehicle": route["vehicle_id"],
@@ -136,46 +185,119 @@ def render_google_map(points: pd.DataFrame, route_result: dict | None, capacity:
                 "route_duration": round(float(route.get("duration_minutes", 0.0)), 1),
                 "next_bin": first_stop["bin_id"] if first_stop else None,
                 "next_eta": first_details.get("estimated_arrival_minutes_from_route_start"),
+                "assignment_comparison": assignment_comparison,
+                "comparison_traffic_source": "Google Routes traffic-aware ETA" if comparison_uses_live_traffic else "simulated road-time estimate",
                 "route_summary": " → ".join(stop["bin_id"] for stop in stops) if stops else "No assigned pickups",
                 "stop_details": [
                     {
                         "bin": stop["bin_id"],
+                        "from": state.get("mock_gps_node", "truck GPS") if stop_index == 0 else stops[stop_index - 1]["bin_id"],
                         "node": stop["node"],
                         "eta": explanation_by_bin.get(stop["bin_id"], {}).get("estimated_arrival_minutes_from_route_start"),
+                        "simulated_leg_distance_km": explanation_by_bin.get(stop["bin_id"], {}).get("leg_distance_from_previous_stop_km"),
                         "urgency": stop["urgency"],
+                        "service_minutes": float(stop.get("service_minutes", 0.0)),
                     }
-                    for stop in stops
+                    for stop_index, stop in enumerate(stops)
                 ],
             })
-    payload = json.dumps({"bins": bins, "center": center, "depot": depot, "routes": routes, "trucks": trucks})
+    payload = json.dumps({"bins": bins, "center": center, "depot": depot, "routes": routes, "trucks": trucks, "selected_vehicle_id": selected_vehicle_id})
     map_html = f"""
-    <div id="map-status" style="font:13px sans-serif;margin:0 0 8px;color:#555">Loading Google road routes...</div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;font:12px Arial,sans-serif;margin:0 0 7px;color:#333">
+      <span><b>Bins</b></span><span style="color:#2e7d32">●</span><span>0–39% full</span><span style="color:#fbc02d">●</span><span>40–69%</span><span style="color:#ef6c00">●</span><span>70–89%</span><span style="color:#d32f2f">●</span><span>90–100%</span>
+      <span style="margin-left:8px"><b>Trucks</b></span><span style="color:#757575">● T</span><span>Idle</span><span style="color:#1565c0">● T</span><span>Pickup assigned</span>
+    </div>
+    <div id="map-status" style="font:12px sans-serif;margin:0 0 7px;color:#555">Loading map...</div>
     <div id="map" style="height:560px;width:100%;border-radius:10px"></div>
     <script>window.ecorouteData = {payload};</script>
     <script>
+      let googleMapsAuthFailed = false;
+      window.gm_authFailure = () => {{
+        googleMapsAuthFailed = true;
+        const mapStatus = document.getElementById('map-status');
+        if (mapStatus) mapStatus.textContent = 'Google Maps rejected GOOGLE_MAPS_API_KEY. Check that Maps JavaScript API is enabled and the browser key allows this dashboard URL.';
+      }};
       async function initEcoRouteMap() {{
         const d = window.ecorouteData;
         const status = document.getElementById('map-status');
         const map = new google.maps.Map(document.getElementById('map'), {{center:d.center, zoom:13, mapTypeControl:false, streetViewControl:false, mapId:'DEMO_MAP_ID'}});
         const info = new google.maps.InfoWindow();
         const fleetBounds = new google.maps.LatLngBounds();
-        d.bins.forEach(bin => fleetBounds.extend(bin));
-        new google.maps.Marker({{position:d.depot, map, title:'Depot', label:{{text:'D', color:'white', fontWeight:'bold'}}, icon:{{path:google.maps.SymbolPath.CIRCLE, fillColor:'#212121', fillOpacity:1, strokeColor:'#fff', strokeWeight:2, scale:12}}}});
+        const selectedRoute = d.routes.find(route => route.vehicle === d.selected_vehicle_id);
+        const selectedTruck = d.trucks.find(truck => truck.vehicle === d.selected_vehicle_id);
+        if (selectedRoute) selectedRoute.path.forEach(point => fleetBounds.extend(point));
+        else if (selectedTruck) fleetBounds.extend(selectedTruck);
+        else d.bins.forEach(bin => fleetBounds.extend(bin));
+        new google.maps.Marker({{position:d.depot, map, title:'Depot', label:{{text:'D', color:'white', fontWeight:'bold'}}, icon:{{path:google.maps.SymbolPath.CIRCLE, fillColor:'#212121', fillOpacity:1, strokeColor:'#fff', strokeWeight:2, scale:10}}}});
         d.bins.forEach(bin => {{
-          const marker = new google.maps.Marker({{position:bin, map, title:`${{bin.id}} — ${{bin.urgency}}`, label:{{text:bin.urgency[0], color:'white', fontWeight:'bold'}}, icon:{{path:google.maps.SymbolPath.CIRCLE, fillColor:bin.color, fillOpacity:1, strokeColor:'#fff', strokeWeight:2, scale:10}}}});
-          marker.addListener('click', () => info.open({{map, anchor:marker, content:`<b>${{bin.id}}</b><br>Urgency: ${{bin.urgency}}<br>Fill level: ${{bin.fill}}%`}}));
+          const marker = new google.maps.Marker({{position:bin, map, title:`${{bin.id}} — ${{bin.fill}}% full`, label:{{text:'B', color:'white', fontWeight:'bold'}}, icon:{{path:google.maps.SymbolPath.CIRCLE, fillColor:bin.color, fillOpacity:1, strokeColor:'#fff', strokeWeight:2, scale:10}}}});
+          marker.addListener('click', () => {{ info.setContent(`<div style="font:13px Arial;line-height:1.55;min-width:190px"><b>🗑️ ${{bin.id}}</b><br><b>Fill:</b> ${{bin.fill}}%<br><b>Zone:</b> ${{bin.zone}}<br><b>Urgency:</b> ${{bin.urgency}}<br><b>Collection needed:</b> ${{bin.needs_collection ? 'Yes' : 'No'}}<br><b>Urgency probability:</b> ${{bin.urgency_probability}}%<br><b>Coordinates:</b> ${{bin.lat.toFixed(5)}}, ${{bin.lng.toFixed(5)}}</div>`); info.open({{map, anchor:marker}}); }});
         }});
         const {{Route}} = await google.maps.importLibrary('routes');
         let roadRouteCount = 0;
         let roadRouteFailures = 0;
-        const roadTracks = {{}};
+        const roadRouteErrors = [];
+        const routeLines = {{}};
+        const showRouteInfo = new Set();
+        const routeBounds = {{}};
+        const routeTracks = {{}};
         const truckPopup = truck => {{
-          const stopRows = truck.has_route ? truck.stop_details.map(stop => `<li><b>${{stop.bin}}</b> (${{stop.node}}) · ${{stop.urgency}} · ETA +${{Number(stop.eta).toFixed(1)}} min</li>`).join('') : '';
+          const assignmentRows = truck.assignment_comparison && truck.assignment_comparison.length
+            ? `<hr style="margin:8px 0"><b>Why this truck for ${{truck.next_bin}}?</b><br><small>Approach time from each truck's mock GPS · ${{truck.comparison_traffic_source}}; capacity and route limits checked.</small><ol style="padding-left:20px;margin:4px 0">${{truck.assignment_comparison.map(candidate => `<li><b>${{candidate.vehicle}}</b>: ${{candidate.eta_minutes == null ? 'ETA unavailable' : `+${{Number(candidate.eta_minutes).toFixed(1)}} min`}} — ${{candidate.selected ? 'assigned to this bin' : candidate.feasible ? 'feasible, but another truck was assigned' : `not eligible (${{candidate.reason || 'capacity/route constraint'}})`}}</li>`).join('')}}</ol>`
+            : '';
+          let googleElapsedMinutes = 0;
+          const stopRows = truck.has_route ? truck.stop_details.map((stop, index) => {{
+            const liveLeg = truck.google_legs && truck.google_legs[index];
+            let legSummary;
+            let arrivalSummary;
+            if (liveLeg) {{
+              googleElapsedMinutes += liveLeg.duration_minutes;
+              legSummary = `Google road leg: ${{liveLeg.distance_km.toFixed(2)}} km · ${{liveLeg.duration_minutes.toFixed(1)}} min`;
+              arrivalSummary = `traffic-aware ETA +${{googleElapsedMinutes.toFixed(1)}} min`;
+            }} else {{
+              legSummary = `simulated leg: ${{Number(stop.simulated_leg_distance_km || 0).toFixed(2)}} km`;
+              arrivalSummary = `simulated ETA +${{Number(stop.eta).toFixed(1)}} min`;
+            }}
+            googleElapsedMinutes += Number(stop.service_minutes || 0);
+            return `<li><b>${{stop.bin}}</b> (${{stop.node}}) from ${{stop.from}} · ${{stop.urgency}} · ${{legSummary}} · ${{arrivalSummary}}</li>`;
+          }}).join('') : '';
+          const googleRouteSummary = truck.google_route
+            ? `<br><b>Google road route:</b> ${{truck.google_route.distance_km.toFixed(2)}} km · ${{truck.google_route.duration_minutes.toFixed(1)}} min drive (traffic-aware, includes return to depot)`
+            : '';
           const truckInfo = truck.has_route
-            ? `<b>Next pickup:</b> ${{truck.next_bin}} · ETA +${{Number(truck.next_eta).toFixed(1)}} min<br><b>Route:</b> ${{truck.route_summary}}<br><b>Estimated route time:</b> ${{truck.route_duration}} min · ${{truck.route_distance}} km<br><b>Pickup sequence and arrival times:</b><ol style="padding-left:20px;margin:4px 0">${{stopRows}}</ol>`
-            : `<b>Status:</b> Idle · no pickup assigned<br><b>Current mock GPS:</b> ${{truck.mock_gps_node}} (${{truck.lat.toFixed(5)}}, ${{truck.lng.toFixed(5)}})`;
-          return `<div style="font:13px Arial;max-width:320px"><b>🚚 ${{truck.vehicle}}</b><br>${{truckInfo}}<b>Current load:</b> ${{truck.current_load}} kg<br><b>Free capacity:</b> ${{truck.remaining}} kg</div>`;
+            ? `<b>Status:</b> Active on pickup route<br><b>Next pickup:</b> ${{truck.next_bin}} (+${{truck.next_eta}} min simulated ETA)<br><b>Planned stops:</b> ${{truck.route_summary}}<br><b>Current mock GPS:</b> ${{truck.mock_gps_node}} (${{truck.lat.toFixed(5)}}, ${{truck.lng.toFixed(5)}})<br><b>Current load:</b> ${{truck.current_load}} kg<br><b>Free capacity after planned pickups:</b> ${{truck.remaining}} kg<br><button id="check-route-${{truck.number}}" style="margin-top:8px;padding:7px 10px;background:#1565c0;color:#fff;border:0;border-radius:5px;cursor:pointer">Check optimized route</button>`
+            : `<b>Status:</b> Idle — no pickup assigned<br><b>Current mock GPS:</b> ${{truck.mock_gps_node}} (${{truck.lat.toFixed(5)}}, ${{truck.lng.toFixed(5)}})<br><b>Current load:</b> ${{truck.current_load}} kg<br><b>Free capacity:</b> ${{truck.remaining}} kg`;
+          return `<div style="font:13px Arial;line-height:1.55;max-width:380px"><b>🚚 ${{truck.vehicle}}</b><br>${{truckInfo}}${{truck.has_route ? assignmentRows : ''}}${{truck.has_route && showRouteInfo.has(truck.vehicle) ? `<hr style="margin:8px 0"><b>Optimized route details</b><br><b>Optimizer estimate:</b> ${{truck.route_distance}} km · ${{truck.route_duration}} min (simulated)${{googleRouteSummary}}<br><b>Pickup legs and arrival times:</b><ol style="padding-left:20px;margin:4px 0">${{stopRows}}</ol>` : ''}}</div>`;
         }};
+        const revealOptimizedRoute = truck => {{
+          Object.values(routeLines).flat().forEach(line => line.setMap(null));
+          showRouteInfo.clear();
+          showRouteInfo.add(truck.vehicle);
+          let lines = routeLines[truck.vehicle] || [];
+          // Keep a visible road-following fallback ready if a Routes polyline could not be created.
+          if (!lines.length && routeTracks[truck.vehicle]?.length) {{
+            const fallbackLine = new google.maps.Polyline({{path:routeTracks[truck.vehicle], geodesic:true, strokeColor:truck.color, strokeOpacity:.95, strokeWeight:6}});
+            routeLines[truck.vehicle] = [fallbackLine];
+            lines = routeLines[truck.vehicle];
+          }}
+          lines.forEach(line => {{ line.setOptions({{strokeOpacity:.98, strokeWeight:7}}); line.setVisible(true); line.setMap(map); }});
+          if (routeBounds[truck.vehicle]) map.fitBounds(routeBounds[truck.vehicle], 56);
+          const marker = truckMarkers[truck.vehicle];
+          info.setContent(truckPopup(truck));
+          info.open({{map, ...(marker ? {{anchor:marker}} : {{position:truck}})}});
+        }};
+        info.addListener('domready', () => {{
+          document.querySelectorAll('[id^="check-route-"]').forEach(button => {{
+            button.onclick = event => {{
+              event.preventDefault();
+              event.stopPropagation();
+              const truck = d.trucks.find(item => `check-route-${{item.number}}` === button.id);
+              if (!truck) return;
+              revealOptimizedRoute(truck);
+            }};
+          }});
+        }});
+        const truckMarkers = {{}};
         for (const route of d.routes) {{
           try {{
             let completeTrack = [];
@@ -183,50 +305,66 @@ def render_google_map(points: pd.DataFrame, route_result: dict | None, capacity:
             // into contiguous chunks, preserving every planned stop and road-following geometry.
             for (let start = 0; start < route.path.length - 1;) {{
               const end = Math.min(start + 24, route.path.length - 1);
-              const request = {{origin:route.path[start], destination:route.path[end], intermediates:route.path.slice(start + 1, end), travelMode:'DRIVING', fields:['path']}};
+              const request = {{origin:route.path[start], destination:route.path[end], intermediates:route.path.slice(start + 1, end), travelMode:'DRIVING', routingPreference:'TRAFFIC_AWARE', fields:['path','legs']}};
               const {{routes}} = await Route.computeRoutes(request);
               if (!routes || !routes.length) throw new Error('No driving route returned');
-              routes[0].createPolylines().forEach(polyline => {{
-                polyline.setOptions({{strokeColor:route.color, strokeOpacity:.9, strokeWeight:5}});
-                polyline.setMap(map);
-                const truck = d.trucks.find(item => item.vehicle === route.vehicle);
-                if (truck) polyline.addListener('click', event => info.open({{map, position:event.latLng, content:truckPopup(truck)}}));
+              const truck = d.trucks.find(item => item.vehicle === route.vehicle);
+              const computedRoute = routes[0];
+              const legMetrics = (computedRoute.legs || []).map(leg => ({{distance_km:leg.distanceMeters / 1000, duration_minutes:leg.durationMillis / 60000}}));
+              if (legMetrics.length !== end - start || legMetrics.some(leg => !Number.isFinite(leg.distance_km) || !Number.isFinite(leg.duration_minutes))) throw new Error('Google route leg distance or ETA was missing');
+              if (truck) {{
+                truck.google_legs = (truck.google_legs || []).concat(legMetrics);
+                truck.google_route = truck.google_legs.reduce((summary, leg) => ({{distance_km:summary.distance_km + leg.distance_km, duration_minutes:summary.duration_minutes + leg.duration_minutes}}), {{distance_km:0, duration_minutes:0}});
+              }}
+              const focused = !d.selected_vehicle_id || route.vehicle === d.selected_vehicle_id;
+              const bounds = routeBounds[route.vehicle] || (routeBounds[route.vehicle] = new google.maps.LatLngBounds());
+              route.path.forEach(point => bounds.extend(point));
+              computedRoute.createPolylines().forEach(polyline => {{
+                polyline.setOptions({{strokeColor:route.color, strokeOpacity:focused ? .95 : .18, strokeWeight:focused ? 6 : 2}});
+                polyline.setMap(null);
+                (routeLines[route.vehicle] || (routeLines[route.vehicle] = [])).push(polyline);
+                if (truck) polyline.addListener('click', event => {{ info.setContent(truckPopup(truck)); info.open({{map, position:event.latLng}}); }});
               }});
-              const legTrack = (routes[0].path || []).map(point => ({{lat:point.lat(), lng:point.lng()}}));
+              const legTrack = (computedRoute.path || []).map(point => ({{
+                lat:typeof point.lat === 'function' ? point.lat() : point.lat,
+                lng:typeof point.lng === 'function' ? point.lng() : point.lng,
+              }}));
               completeTrack = completeTrack.concat(completeTrack.length ? legTrack.slice(1) : legTrack);
               start = end;
             }}
-            // Downsample to a smooth, bounded animation loop.
-            const stride = Math.max(1, Math.ceil(completeTrack.length / 180));
-            roadTracks[route.vehicle] = completeTrack.filter((_, index) => index % stride === 0);
+            routeTracks[route.vehicle] = completeTrack;
+            if (completeTrack.length) {{
+              const bounds = routeBounds[route.vehicle] || (routeBounds[route.vehicle] = new google.maps.LatLngBounds());
+              completeTrack.forEach(point => bounds.extend(point));
+            }}
+            // Keep route geometry and metrics ready, but only draw the route when requested.
             roadRouteCount += 1;
           }} catch (error) {{
             console.error('Google road route unavailable for ' + route.vehicle, error);
-            const fallbackLine = new google.maps.Polyline({{path:route.path, geodesic:true, strokeColor:route.color, strokeOpacity:.45, strokeWeight:3, map}});
+            roadRouteErrors.push(route.vehicle + ': ' + (error && error.message ? error.message : String(error)));
             const truck = d.trucks.find(item => item.vehicle === route.vehicle);
-            if (truck) fallbackLine.addListener('click', event => info.open({{map, position:event.latLng, content:truckPopup(truck)}}));
-            roadTracks[route.vehicle] = route.path;
+            if (truck) {{ delete truck.google_legs; delete truck.google_route; }}
+            const focused = !d.selected_vehicle_id || route.vehicle === d.selected_vehicle_id;
+            const fallbackLine = new google.maps.Polyline({{path:route.path, geodesic:true, strokeColor:route.color, strokeOpacity:.9, strokeWeight:4, map:null}});
+            routeLines[route.vehicle] = [fallbackLine];
+            if (truck) fallbackLine.addListener('click', event => {{ info.setContent(truckPopup(truck)); info.open({{map, position:event.latLng}}); }});
             roadRouteFailures += 1;
           }}
         }}
-        const animatedTrucks = [];
         d.trucks.forEach((truck, index) => {{
-          fleetBounds.extend(truck);
-          const markerTitle = truck.next_bin ? `${{truck.vehicle}} → ${{truck.next_bin}} (+${{truck.next_eta}} min)` : `${{truck.vehicle}} — no assigned pickup`;
-          const marker = new google.maps.Marker({{position:truck, map, title:markerTitle, label:{{text:`T${{truck.number}}`, color:'white', fontWeight:'bold'}}, icon:{{path:google.maps.SymbolPath.FORWARD_CLOSED_ARROW, fillColor:truck.color, fillOpacity:1, strokeColor:'#222', strokeWeight:1, scale:6}}}});
-          marker.addListener('click', () => info.open({{map, anchor:marker, content:truckPopup(truck)}}));
-          animatedTrucks.push({{truck, marker, step:0}});
+          if (!selectedRoute && !selectedTruck) fleetBounds.extend(truck);
+          const markerTitle = truck.next_bin ? `${{truck.vehicle}} → ${{truck.next_bin}} (+${{truck.next_eta}} min)` : `${{truck.vehicle}} — idle`;
+          const isSelected = truck.vehicle === d.selected_vehicle_id;
+          const marker = new google.maps.Marker({{position:truck, map, title:markerTitle, zIndex:isSelected ? 1000 : index, label:{{text:'T', color:'white', fontWeight:'bold'}}, icon:{{path:google.maps.SymbolPath.CIRCLE, fillColor:truck.has_route ? '#1565c0' : '#757575', fillOpacity:1, strokeColor:'#fff', strokeWeight:isSelected ? 3 : 2, scale:11}}}});
+          truckMarkers[truck.vehicle] = marker;
+          marker.addListener('click', () => {{ info.setContent(truckPopup(truck)); info.open({{map, anchor:marker}}); }});
         }});
-        // Animation follows the road geometry returned by Google Routes, then loops for repeated simulation.
-        setInterval(() => animatedTrucks.forEach(item => {{
-          const track = roadTracks[item.truck.vehicle];
-          if (item.truck.has_route && track && track.length > 1) {{
-            item.step = (item.step + 1) % track.length;
-            item.marker.setPosition(track[item.step]);
-          }}
-        }}), 160);
         if (d.bins.length || d.trucks.length) map.fitBounds(fleetBounds, 48);
-        status.textContent = roadRouteFailures === 0 ? `Google road routes shown for ${{roadRouteCount}} truck(s). All ${{d.trucks.length}} truck markers are visible and animated.` : `Google Routes API failed for ${{roadRouteFailures}} truck(s); those routes use faint straight fallback lines. Enable Routes API and check key restrictions.`;
+        status.textContent = googleMapsAuthFailed
+          ? 'Google Maps rejected GOOGLE_MAPS_API_KEY. Check that Maps JavaScript API is enabled and the browser key allows this dashboard URL.'
+          : roadRouteFailures === 0
+            ? `Map ready. Google road route available for ${{roadRouteCount}} active truck(s); route lines appear when you check a truck's optimized route.`
+            : `Map ready. Google Routes failed for ${{roadRouteFailures}} truck(s); ${{roadRouteErrors.join(' | ')}}`;
       }}
     </script>
     <script async src="https://maps.googleapis.com/maps/api/js?key={key}&libraries=routes&callback=initEcoRouteMap"></script>
@@ -239,7 +377,7 @@ with st.sidebar:
     bin_count = st.slider("Simulated bins", 20, 100, 64, 4)
     days = st.slider("History days", 5, 60, 30, 5)
     seed = st.number_input("Random seed", min_value=0, value=42, step=1)
-    truck_count = st.slider("Available trucks", 1, 4, 2)
+    truck_count = st.slider("Available trucks", 1, 10, 10)
     truck_capacity = st.number_input("Truck capacity (kg)", min_value=100.0, value=1600.0, step=100.0)
     traffic_multiplier = st.slider("Simulated traffic level", 1.0, 3.0, 1.0, 0.1, help="Scales the graph's reproducible per-road congestion estimates; this is not live traffic.")
     truck_nodes = []
@@ -296,12 +434,30 @@ with tabs[2]:
     selected["node"] = selected.bin_id.map(node_for)
     selected["demand_kg"] = selected.capacity_kg * selected.current_fill_level_pct / 100
     st.write(f"**{len(selected)}** selected bins will be considered. Critical bins remain mandatory; infeasible bins are reported, never silently removed.")
+    st.caption("Each bin is assigned to the closest truck by traffic-weighted road time, as long as that truck has enough payload and route time. Capacity is reserved as assignments are made; OR-Tools then orders pickups for each truck.")
     if st.button("Optimize current planning cycle", type="primary"):
         graph = build_grid_graph(seed=int(seed), traffic_multiplier=float(traffic_multiplier))
         stops = [Stop(bin_id=row.bin_id, node=row.node, demand_kg=float(row.demand_kg), urgency=row.urgency_category) for _, row in selected.iterrows()]
         vehicles = [Vehicle(f"truck-{i + 1}", float(truck_capacity), current_node=truck_nodes[i], current_load_kg=truck_loads[i], max_duration_minutes=480) for i in range(truck_count)]
-        result = solve(graph, "n0_0", stops, vehicles, time_limit_seconds=int(solver_seconds))
+        live_travel_matrix = {}
+        expected_matrix_pairs = len(vehicles) * len(stops)
+        matrix_error = None
+        routes_key = google_routes_server_key()
+        if routes_key:
+            try:
+                live_travel_matrix = fetch_live_travel_matrix(routes_key, graph, vehicles, stops)
+                if not live_travel_matrix:
+                    matrix_error = "Google Routes returned no usable truck-to-bin routes."
+            except Exception as exc:
+                matrix_error = str(exc)
+        else:
+            matrix_error = "Set GOOGLE_ROUTES_API_KEY to a server-restricted Routes API key to use live traffic for assignment."
+        result = solve(
+            graph, "n0_0", stops, vehicles, time_limit_seconds=int(solver_seconds),
+            live_travel_matrix=live_travel_matrix or None,
+        )
         metrics = totals(result)
+        st.session_state["selected_route_vehicle"] = None
         fleet_snapshot = []
         for vehicle in vehicles:
             gps = graph.nodes[vehicle.current_node]
@@ -311,11 +467,30 @@ with tabs[2]:
                 "capacity_kg": vehicle.capacity_kg, "current_load_kg": vehicle.current_load_kg,
                 "free_capacity_kg": vehicle.capacity_kg - vehicle.current_load_kg,
             })
-        st.session_state["route_result"] = result.to_dict() | {"metrics": metrics, "fleet_snapshot": fleet_snapshot, "assignment_explanations": explain_assignments(graph, "n0_0", result.routes, vehicles, result.solver), "rolling_interval": rolling_interval, "solver_budget": solver_seconds}
+        st.session_state["route_result"] = result.to_dict() | {
+            "metrics": metrics,
+            "fleet_snapshot": fleet_snapshot,
+            "assignment_explanations": explain_assignments(
+                graph, "n0_0", result.routes, vehicles, result.solver, live_travel_matrix
+            ),
+            "rolling_interval": rolling_interval,
+            "solver_budget": solver_seconds,
+            "assignment_live_pairs": len(live_travel_matrix),
+            "assignment_expected_pairs": expected_matrix_pairs,
+            "assignment_matrix_error": matrix_error,
+        }
     result = st.session_state.get("route_result")
     if result:
         status = result["status"]
         (st.success if status == "FEASIBLE" else st.error)(f"Solver status: {status} ({result['solver']})")
+        live_pairs = int(result.get("assignment_live_pairs", 0))
+        expected_pairs = int(result.get("assignment_expected_pairs", 0))
+        if live_pairs and live_pairs == expected_pairs:
+            st.success(f"Truck assignment used Google Routes traffic-aware ETAs for all {live_pairs} truck-to-bin pairs.")
+        elif live_pairs:
+            st.warning(f"Google Routes returned live ETAs for {live_pairs} of {expected_pairs} truck-to-bin pairs; remaining comparisons use simulated road times.")
+        else:
+            st.warning(f"Truck assignment is using simulated traffic. {result.get('assignment_matrix_error') or 'Google Routes live matrix is unavailable.'}")
         st.caption(f"Rolling-horizon cycle: refresh this plan every {result['rolling_interval']} minutes or immediately when a bin becomes critical. Solver budget: {result['solver_budget']} seconds.")
         if result.get("fleet_snapshot"):
             st.subheader("Mock GPS and truck capacity snapshot used for this plan")
@@ -338,7 +513,7 @@ with tabs[2]:
             dispatch_rows.append({
                 "Truck": route["vehicle_id"], "Mock GPS": state.get("mock_gps_node", route["road_path"][0] if route["road_path"] else "n0_0"),
                 "Next pickup": next_stop["bin_id"] if next_stop else "No assigned pickup",
-                "Next ETA (+min)": round(float(next_info["estimated_arrival_minutes_from_route_start"]), 1) if next_info.get("estimated_arrival_minutes_from_route_start") is not None else "—",
+                "Next ETA (+min)": round(float(next_info["estimated_arrival_minutes_from_route_start"]), 1) if next_info.get("estimated_arrival_minutes_from_route_start") is not None else None,
                 "Assigned stops": len(route["stops"]),
                 "Free capacity (kg)": round(float(state.get("free_capacity_kg", 0)) - sum(float(stop["demand_kg"]) for stop in route["stops"]), 1),
             })
@@ -349,6 +524,8 @@ with tabs[2]:
             if not stops:
                 with st.expander(f"{route['vehicle_id']} — no assigned pickups"):
                     st.info(f"This truck is available at mock GPS node {state.get('mock_gps_node', 'n0_0')} but has no pickups in this plan.")
+                    if st.button(f"Show {route['vehicle_id']} GPS on map", key=f"show_route_{route['vehicle_id']}"):
+                        st.session_state["selected_route_vehicle"] = route["vehicle_id"]
                 continue
             first = stops[0]
             first_info = explanation_by_bin.get(first["bin_id"], {})
@@ -356,26 +533,28 @@ with tabs[2]:
             with st.expander(f"{route['vehicle_id']} — next pickup {first['bin_id']} (+{eta:.1f} min)"):
                 st.info(f"Dispatch notice: {route['vehicle_id']} should go to {first['bin_id']} first. Estimated arrival is +{eta:.1f} minutes from route start.")
                 st.write(f"Starting at mock GPS node **{state.get('mock_gps_node', route['road_path'][0])}** · current load **{route['starting_load_kg']:.1f} kg** · route distance **{route['distance_km']:.2f} km** · estimated duration **{route['duration_minutes']:.1f} min**.")
+                if st.button(f"Show {route['vehicle_id']} route on map", key=f"show_route_{route['vehicle_id']}"):
+                    st.session_state["selected_route_vehicle"] = route["vehicle_id"]
                 stop_rows = []
                 for index, stop in enumerate(stops, start=1):
                     detail = explanation_by_bin.get(stop["bin_id"], {})
                     stop_rows.append({
                         "Order": index, "Pickup": stop["bin_id"], "Location node": stop["node"],
                         "Urgency": stop["urgency"],
-                        "ETA from route start (+min)": detail.get("estimated_arrival_minutes_from_route_start"),
-                        "Leg distance (km)": detail.get("leg_distance_from_previous_stop_km"),
+                        "ETA from route start (simulated min)": detail.get("estimated_arrival_minutes_from_route_start"),
+                        "Leg distance (simulated km)": detail.get("leg_distance_from_previous_stop_km"),
                         "Pickup demand (kg)": detail.get("demand_kg"),
                         "Truck load after pickup (kg)": detail.get("load_after_pickup_kg"),
                         "Free capacity after pickup (kg)": detail.get("capacity_remaining_after_pickup_kg"),
                     })
                 st.dataframe(pd.DataFrame(stop_rows), use_container_width=True, hide_index=True)
         st.subheader("Why each bin was assigned to that truck")
-        st.caption("The optimizer selects routes jointly across the fleet. Insertion estimates compare the added time and distance if a bin were inserted into each truck's planned route; they are explanatory estimates, not a nearest-truck-only rule.")
+        st.caption("Each bin goes to the closest truck by traffic-weighted road time, provided that truck has enough remaining payload. Bin assignments reserve capacity in urgency and load order; the optimizer then orders each truck's pickups.")
         if result.get("assignment_explanations"):
             explain_rows = []
             for item in result["assignment_explanations"]:
                 options = "; ".join(
-                    f"{candidate['vehicle_id']}: " + (f"{candidate['estimated_added_minutes']:.1f} min, {candidate['capacity_remaining_after_kg']:.0f} kg free" if candidate["feasible"] else "not feasible")
+                    f"{candidate['vehicle_id']}: " + (f"{candidate['approach_minutes']:.1f} min from GPS, {candidate['capacity_remaining_after_kg']:.0f} kg free" if candidate["feasible"] else f"{candidate.get('approach_minutes', 0):.1f} min from GPS, not feasible")
                     for candidate in item["vehicle_insertion_estimates"]
                 )
                 explain_rows.append({
@@ -393,8 +572,14 @@ with tabs[2]:
         with st.expander("Independent validation report"):
             st.json(result["validation"])
         st.subheader("Bins and planned truck routes")
-        render_google_map(latest, result, float(truck_capacity))
-        st.caption("Select a truck marker to see its next pickup, estimated arrival, ordered stop list, and free capacity. Road geometry appears when Google Routes API is enabled; otherwise the fallback map connects planned locations with straight lines.")
+        selected_route_vehicle = st.session_state.get("selected_route_vehicle")
+        if selected_route_vehicle:
+            st.info(f"Map focused on {selected_route_vehicle}. Its truck marker opens Google road distance and traffic-aware ETA for each pickup leg when Routes API is available.")
+            if st.button("Show all truck routes on map", key="show_all_routes"):
+                st.session_state["selected_route_vehicle"] = None
+                selected_route_vehicle = None
+        render_google_map(latest, result, float(truck_capacity), selected_route_vehicle)
+        st.caption("Select a truck marker or route line for its ordered stops. Choose a truck's Show route on map button above to focus the map and open per-leg distance and ETA details. Google road distances and traffic-aware drive times come from Routes API; optimizer distance and ETA are simulated graph estimates.")
 
 with tabs[3]:
     st.subheader("How to interpret this prototype")

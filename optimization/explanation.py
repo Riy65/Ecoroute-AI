@@ -19,8 +19,11 @@ def _route_cost(graph: nx.Graph, depot: str, start: str, stops: list) -> tuple[f
     return distance + leg_distance, travel + leg_time, service
 
 
-def explain_assignments(graph: nx.Graph, depot: str, routes: list[Route], vehicles: list[Vehicle], solver: str = "") -> list[dict]:
-    """Explain each chosen bin assignment and compare feasible route insertions."""
+def explain_assignments(
+    graph: nx.Graph, depot: str, routes: list[Route], vehicles: list[Vehicle], solver: str = "",
+    live_travel_matrix: dict[tuple[str, str], dict[str, float]] | None = None,
+) -> list[dict]:
+    """Explain each chosen bin assignment and compare truck approach ETAs."""
     vehicle_by_id = {vehicle.vehicle_id: vehicle for vehicle in vehicles}
     route_by_id = {route.vehicle_id: route for route in routes}
     explanations = []
@@ -46,8 +49,12 @@ def explain_assignments(graph: nx.Graph, depot: str, routes: list[Route], vehicl
                 if vehicle.vehicle_id == chosen_vehicle.vehicle_id:
                     base_stops.remove(stop)
                 start_node = vehicle.current_node or depot
+                _, _, simulated_approach_minutes = shortest_leg(graph, start_node, stop.node)
+                live_leg = (live_travel_matrix or {}).get((vehicle.vehicle_id, stop.bin_id))
+                approach_minutes = live_leg["duration_minutes"] if live_leg else simulated_approach_minutes
                 base_distance, base_travel, base_service = _route_cost(graph, depot, start_node, base_stops)
                 best = None
+                best_any = None
                 for position in range(len(base_stops) + 1):
                     proposed = base_stops[:position] + [stop] + base_stops[position:]
                     load_after = vehicle.current_load_kg + sum(item.demand_kg for item in proposed)
@@ -63,15 +70,30 @@ def explain_assignments(graph: nx.Graph, depot: str, routes: list[Route], vehicl
                     estimate = {
                         "vehicle_id": vehicle.vehicle_id,
                         "feasible": feasible,
+                        "approach_minutes": round(approach_minutes, 2),
                         "estimated_added_minutes": round(added_minutes, 2),
                         "estimated_added_distance_km": round(added_distance, 3),
                         "load_after_kg": round(load_after, 2),
                         "capacity_remaining_after_kg": round(vehicle.capacity_kg - load_after, 2),
                     }
+                    if best_any is None or added_minutes < best_any["estimated_added_minutes"]:
+                        best_any = estimate
                     if feasible and (best is None or added_minutes < best["estimated_added_minutes"]):
                         best = estimate
                 if best is None:
-                    candidates.append({"vehicle_id": vehicle.vehicle_id, "feasible": False})
+                    rejected = best_any or {
+                        "vehicle_id": vehicle.vehicle_id,
+                        "feasible": False,
+                        "approach_minutes": round(approach_minutes, 2),
+                    }
+                    rejected["feasible"] = False
+                    rejected["infeasible_reason"] = (
+                        "payload capacity exceeded" if rejected.get("load_after_kg", 0) > vehicle.capacity_kg + 1e-8 else
+                        "route distance limit exceeded" if vehicle.max_distance_km is not None and base_distance + rejected.get("estimated_added_distance_km", 0) > vehicle.max_distance_km + 1e-8 else
+                        "route time limit exceeded" if vehicle.max_duration_minutes is not None and base_travel + base_service + rejected.get("estimated_added_minutes", 0) > vehicle.max_duration_minutes + 1e-8 else
+                        "no feasible insertion in planned route"
+                    )
+                    candidates.append(rejected)
                 else:
                     candidates.append(best)
 
@@ -93,7 +115,9 @@ def explain_assignments(graph: nx.Graph, depot: str, routes: list[Route], vehicl
                 "chosen_vehicle_insertion_estimate": selected,
                 "vehicle_insertion_estimates": candidates,
                 "decision_basis": (
-                    "Joint fleet route minimizes estimated travel and service time subject to capacity, distance, duration, and availability constraints."
+                    "Truck is selected by Google Routes traffic-aware ETA from its mock GPS location, among trucks with enough remaining payload. Pickup order is then optimized within each truck's assigned stops."
+                    if live_travel_matrix and (chosen_vehicle.vehicle_id, stop.bin_id) in live_travel_matrix else
+                    "Truck is selected by traffic-weighted simulated road time from its mock GPS location, among trucks with enough remaining payload. Pickup order is then optimized within each truck's assigned stops."
                     if solver.startswith("ortools") else
                     "Deterministic heuristic selected the nearest currently feasible vehicle, prioritizing higher urgency first."
                 ),

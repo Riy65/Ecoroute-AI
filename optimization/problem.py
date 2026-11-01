@@ -81,4 +81,4 @@ class RoutingResult:
                 "routes": [r.to_dict() for r in self.routes], "unserved": self.unserved,
                 "validation": self.validation, "runtime_seconds": self.runtime_seconds,
                 "objective_distance_km": self.objective_distance_km,
-                "objective": "minimize_estimated_travel_time"}
+                "objective": "nearest_capable_truck_assignment_then_route_time_optimization"}

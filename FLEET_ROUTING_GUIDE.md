@@ -24,7 +24,7 @@ Each pickup has a graph node, estimated waste demand, service time, and urgency.
 4. Treats critical pickups as mandatory. If a required pickup cannot be served, it is reported as unserved and the plan is marked infeasible. Other unserved pickups are also reported with a reason.
 5. Reconstructs route distance and time from graph edges and independently validates the result.
 
-The solver aims to minimize simulated driving and service time. It returns a good feasible plan within its time limit; it does not claim a globally optimal plan. If OR-Tools is unavailable, a deterministic nearest-feasible heuristic is used instead.
+For each bin, the planner selects the truck with the shortest traffic-weighted road time from its mock GPS location among trucks with enough remaining payload. It reserves capacity in urgency and demand order, then uses OR-Tools to order each truck's assigned pickups while respecting route limits. It returns a good feasible plan within its time limit; it does not claim a globally optimal plan. If OR-Tools is unavailable, a deterministic nearest-feasible heuristic is used instead.
 
 ## What the dashboard shows
 
@@ -35,11 +35,13 @@ The result includes:
 - A fleet snapshot showing the mock GPS node, coordinates, current load, and free capacity used for the plan.
 - A dispatch overview showing each truck's next pickup, estimated arrival, number of assigned stops, and capacity left after the planned pickups.
 - An expandable truck detail with its ordered stop list, each stop's ETA from route start, pickup demand, and remaining capacity after each pickup.
-- A map with all active trucks. An idle truck remains at its mock GPS location. A truck with pickups is animated along its planned route when route geometry is available.
-- A clickable truck marker and clickable route line. Selecting either opens the truck's pickup order, per-stop ETAs, estimated route duration and distance, and capacity details. Selecting an idle truck shows its GPS node, coordinates, and idle status.
-- Per-bin assignment explanations. These compare feasible insertions into each planned truck route to help explain the selected assignment. They are explanatory estimates; the final assignment comes from the joint fleet optimization.
+- A map with each bin as a **B** marker. Its color shows fill level: green (0–39%), yellow (40–69%), orange (70–89%), and red (90–100%). Clicking it shows fill, zone, urgency, collection prediction, and coordinates.
+- Each truck appears as a **T** marker at its mock GPS position. Gray means idle; blue means it has pickups assigned. Clicking a truck shows its status, current load, remaining capacity, next pickup, and planned pickup sequence.
+- Active truck popups include **Check optimized route**. It draws and zooms to that truck's road route, then shows the optimizer's simulated route estimate plus Google road distance and traffic-aware ETA by pickup leg when Routes API is available. Idle trucks stay as GPS markers without a route line. If Routes API fails, the popup falls back to simulated leg distance and ETA.
+- A **Show truck route on map** action in each truck card focuses the map on that truck. The map keeps route lines hidden until an operator asks to check the active truck's route.
+- Per-bin assignment explanations. These show traffic-weighted approach time and remaining capacity for each truck, so the nearest capable assignment is visible.
 
-Arrival times are estimated minutes from the current plan's start, not live ETAs. Re-run the optimizer after changing truck locations, loads, traffic settings, or the pickup manifest to create an updated plan.
+The optimizer's route order and ETA remain simulated graph estimates. Google route distance and traffic-aware time are provided for explanation in the route popup; arrival estimates add the prototype's service time at prior pickups. Re-run the optimizer after changing truck locations, loads, traffic settings, or the pickup manifest to create an updated plan.
 
 ## API endpoint
 
@@ -79,16 +81,16 @@ The dashboard uses two Google Maps services when a key is configured:
 - **Maps JavaScript API** renders the interactive base map and its markers.
 - **Routes API** supplies road-following route geometry for planned truck routes.
 
-Enable both APIs in the same billing-enabled Google Cloud project. The API key must allow both APIs and the dashboard's local website referrer. Configure the key as `GOOGLE_MAPS_API_KEY` in `.env` or Streamlit secrets. Keep the key private and out of version control.
+Enable the Maps JavaScript API and Routes API in a billing-enabled Google Cloud project. Configure `GOOGLE_MAPS_API_KEY` as a browser key with an HTTP-referrer restriction for the dashboard. For live assignment ETAs, configure a separate `GOOGLE_ROUTES_API_KEY` as a server key restricted to the server IP and Routes API. The server key must remain private and out of version control. The route matrix uses traffic-aware drive durations for truck-to-bin comparisons; if that request fails or the server key is missing, the dashboard explicitly reports that assignment used simulated travel times.
 
-Google Routes is used for map road geometry and truck animation. The optimizer's route assignment, traffic adjustment, route distance, route duration, and stop ETAs come from the local simulated graph; they do not use Google's live traffic or travel-time result. If the Routes API request fails, the map draws a faint straight-line fallback between planned locations. The dashboard displays a warning in that case.
+Google Routes supplies road geometry and traffic-aware distance/time for the route popup. The optimizer's route assignment, traffic adjustment, route distance, route duration, and stop ETAs come from the local simulated graph; they do not use Google's live traffic or travel-time result. If a Routes API request fails, the popup labels and uses simulated leg distance and ETA.
 
 ## Prototype boundaries
 
-- GPS positions, coordinates, road links, congestion, bin demand, and pickup ETAs are simulated.
+- GPS positions, coordinates, road links, and bin demand are simulated. Assignment uses Google traffic-aware ETA when the separate server key is available; local graph ETAs are the fallback. Route constraints and route-start ETAs remain simulated graph estimates.
 - There is no live GPS ingestion, live traffic feed, automatic background re-optimization scheduler, or real driver push notification. The dashboard's “Dispatch notice” is an on-screen explanation of the first planned pickup.
 - The rolling-horizon interval is a planning setting/response description; the operator must trigger a new optimization cycle in this prototype.
-- The Google map displays road geometry when the Routes API is available, but Google does not choose which truck gets each bin.
+- Google supplies road geometry and the selected popup's traffic-aware leg metrics when Routes API is available, but Google does not choose which truck gets each bin. Assignment and route order still come from the simulated graph optimizer.
 - The optimizer does not split a bin's demand across trucks. Time windows are not enforced.
 
 These boundaries make the demo explainable while keeping the fleet assignment and capacity decisions visible in the code and dashboard.
